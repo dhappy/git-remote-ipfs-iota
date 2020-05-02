@@ -1,14 +1,14 @@
 {
-  "name": "git-remote-ipfs",
+  "name": "git-remote-igis",
   "version": "0.3.0",
   "description": "Git remote that interacts with the IPFS ecosystem",
-  "main": "index.js",
+  "main": "git-remote-igis",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dhappy/git-remote-ipfs.git"
+    "url": "git+https://github.com/dhappy/git-remote-igis.git"
   },
   "keywords": [
     "IPFS",
@@ -18,7 +18,10 @@
   "author": "Will Holcomb <w+git@dhappy.org>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/dhappy/git-remote-ipfs/issues"
+    "url": "https://github.com/dhappy/git-remote-igis/issues"
   },
-  "homepage": "https://github.com/dhappy/git-remote-ipfs#readme"
+  "homepage": "https://github.com/dhappy/git-remote-igis#readme",
+  "dependencies": {
+    "nodegit": "^0.26.5"
+  }
 }
