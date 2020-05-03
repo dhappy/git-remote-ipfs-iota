@@ -1,8 +1,8 @@
 {
   "name": "git-remote-igis",
-  "version": "0.3.0",
+  "version": "0.3.6",
   "description": "Git remote that interacts with the IPFS ecosystem",
-  "main": "git-remote-igis",
+  "bin": "git-remote-igis",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -13,15 +13,20 @@
   "keywords": [
     "IPFS",
     "IGiS",
-    "IPNS"
+    "IPNS",
+    "git"
   ],
-  "author": "Will Holcomb <w+git@dhappy.org>",
+  "author": "Will Holcomb <dys@dhappy.org>",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/dhappy/git-remote-igis/issues"
   },
   "homepage": "https://github.com/dhappy/git-remote-igis#readme",
   "dependencies": {
-    "nodegit": "^0.26.5"
+    "ipfs": "^0.43.1",
+    "ipfs-http-client": "^44.0.1",
+    "it-all": "^1.0.2",
+    "nodegit": "^0.26.5",
+    "tmp": "^0.2.1"
   }
 }

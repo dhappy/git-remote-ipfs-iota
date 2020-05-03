@@ -14,25 +14,121 @@ if(process.argv.length < 2) {
 }
 
 const readline = require('readline')
-var rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: true,
+const rl = readline.createInterface({
+  input: process.stdin, output: process.stdout, terminal: true,
+})
+
+const Git = require('nodegit')
+const IPFS = require('ipfs')
+const IPFSProxy = require('ipfs-http-client')
+const tmp = require('tmp')
+const { exec } = require('child_process')
+const multihash = require('multihashes')
+const all = require('it-all')
+
+const objForSig = (sig) => ({
+  name: sig.name(), email: sig.email(),
+  time: sig.when().time(), offset: sig.when().offset()
 })
 
 rl.on('line', async (line) => {
-  switch(line) {
-    case 'capabilities':
-      console.debug('Capabilities Querried')
-      process.stdout.write("push\n")
-      process.stdout.write("fetch\n\n")
-    break
-    case 'list for-push':
-      const Git = require('nodegit')
-      const repo = await Git.Repository.open('.')
-      console.debug('t')
-    break
-    default:
-      console.debug(line)
+  const repo = await Git.Repository.open('.')
+  const ipfs = IPFSProxy()
+
+  const treeFor = async ({ cid }) => {
+    tb = Git.Treebuilder.create(repo)
+    (await ipfs.dag.get(cid)).forEach(p => {
+      tb.insert(filename, id, filemode)
+    })
+  }
+
+  const commitFor = async ({ cid }) => {
+    const root = (await ipfs.dag.get(cid)).value
+    const { author, committer, encoding, message, tree, parents } = root
+    const treeCID = treeFor({ cid: tree })
+
+    return Git.Commit.createBuffer(
+      repo,
+      Git.Signature.create(author.name, author.email, author.time, author.offset),
+      Git.Signature.create(committer.name, committer.email, committer.time, committer.offset),
+      encoding, message,
+      tree, parents.length, parents,
+    )
+  }
+
+  const addTree = async (tree) => {
+    var out = {}
+    await Promise.all(tree.entries().map(async e => {
+      let cid
+      if(e.isBlob()) {
+        cid = await all(ipfs.add((await e.getBlob()).content()))
+      } else if(e.isTree()) {
+        cid = await addTree(await e.getTree())
+      } else {
+        console.warn('Neither Blob nor Tree TreeEntry')
+      }
+      out[e.name()] = { oid: e.oid(), cid: cid, mode: e.filemode() }
+    }))
+    return await ipfs.dag.put(out)
+  }
+
+  const addCommit = async (oid) => {
+    const head = await Git.Commit.lookup(repo, oid)
+    const treeCID = await addTree(await head.getTree())
+    const parents = {}
+    await Promise.all((await head.parents()).map(async p => {
+      parents[p] = await addCommit(p)
+    }))
+
+    const obj = {
+      authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
+      encoding: head.messageEncoding(), message: head.message(),
+      parents: parents, tree: new IPFSProxy.CID(treeCID)
+    }
+    try {
+      obj.signature = await head.headerField('gpgsig')
+    } catch(err) { /* No signature */ }
+
+    const cid = await ipfs.dag.put(obj)
+    console.debug(cid)
+
+    return cid
+  }
+
+  if(line === 'capabilities') {
+    process.stdout.write("push\n")
+    process.stdout.write("fetch\n\n")
+  } else if(line === 'list') {
+    const branch = await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)
+    process.stdout.write(`@${branch.value} HEAD\n`)
+    const refs = await ipfs.dag.get(`${process.argv[3]}/.git/refs`)
+    const root = await commitFor({ cid: refs.value.heads.master })
+    process.stdout.write(`${root.target()} refs/heads/master`)
+
+    console.debug((new IPFSProxy.CID(refs.value.heads.master)).codec)
+  } else if(line === 'list for-push') {
+    let refs = await repo.getReferences()
+    refs.filter(r => r.isBranch() || r.isTag()).forEach(
+      // This forces an update everytime.
+      r => process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
+    )
+    process.stdout.write("\n")
+  } else if(line.startsWith('push')) {
+    [src, dst] = line.split(' ')[1].split(':')
+    try {
+      const cid = await addCommit(await Git.Reference.nameToId(repo, src))
+      let currHash = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
+      const meta = await ipfs.dag.put({
+        HEAD: src, refs: { heads: { master: new IPFSProxy.CID(cid) } }
+      })
+      currHash = await ipfs.object.patch.addLink(
+        currHash, { name: '.git', cid: meta }, { create: true }
+      )
+      console.debug(`c:${currHash}`)
+    } catch(e) {
+      console.debug(e)
+    }
+  } else {
+    console.debug(line)
   }
 })

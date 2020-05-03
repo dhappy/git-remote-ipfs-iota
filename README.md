@@ -1,12 +1,10 @@
-# Git IPFS Remote Helper
+# Interplanetary Git Service (IGiS) Remote Helper
 
-Push and fetch commits to IPFS with a published version of the contents.
+Push and fetch commits to IPFS.
 
 ## Installation
-1. `go get -v github.com/dhappy/git-remote-ipfs/cmd/git-remote-ipfs/...`
-2. `cp --no-dereference "$GOPATH/src/github.com/dhappy/git-remote-ipfs/cmd/git-remote-ipfs/git-remote-ipns" "$GOBIN"`
 
-#2 assumes the environment variables `$GOPATH` and `$GOBIN` are defined and `$GOBIN` is in your `$PATH`.
+`npm install --global git-remote-igis`
 
 ## Usage
 
@@ -51,7 +49,7 @@ The virtual filesystem makes all the trees associated with all the commits avail
 
 ## Overview
 
-Git is at its core an object database. There are four types of objects and they are stored by the SHA1 hash of the serialized form in `.git/objects`.
+Git is at its core an object database. There are four types of objects: Commits, Trees, Tags, & Blobs.
 
 When a remote helper is asked to push, it receives the key of a Commit object. That commit has an associated Tree and zero or more Commit parents.
 
@@ -61,17 +59,29 @@ Tags are named links to specific commits. They are frequently used to mark versi
 
 The helper traverses the tree and parents of the root Commit and stores them all on the remote.
 
-Integrating Git and IPFS has been on ongoing work with several solutions over the years. The predecessor to this one used `ipfs block put` to store the Commit tree using SHA1. Fetching converts the SHA1 keys in the raw git blocks to IPFS content ids and retrieves them directly.
+### IPLD Git Remote
 
-The SHA1 keys used by Git aren't exactly the hash of the object. Each serialized form is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
+Integrating Git and IPFS has been on ongoing work with several solutions over the years. The predecessor to this one stored the raw blocks in the IPFS DAG using a multihash version of git's SHA1s.
+
+The SHA1 keys used by Git aren't exactly for the hash of the object. Each serialized form is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
 
 Because the IPLD remote stores the raw Git blocks, the file data is fully present, but unreadable because of the header.
 
-There were also technical issues because the contents of a `block put` aren't sharded and there are reliability problems with large blocks.
+### v0.2
 
-This project mitigates that issue by leaving off the header and storing the simple serialized form in a named directory. The filename is the SHA1 key for the file contents.
+v0.2 of this project was based on the IPLD helper and was thus in Go. It created named directories for different the types of objects and removed the header for the stored version.
 
-When fetching, a map is created between the SHA1 keys and their CID along with the type. A traditional headered block can then be generated.
+This allowed creating a checked out version of the repository for essentially free because all the files are already present in the repository.
+
+Unfortunately, with that representation of the object store the entire thing has to be written every time you push. It is monumentally slow for an operation that's done so frequently.
+
+### v0.3
+
+v0.3 is a Node app which leverages the IPFS DAG to create a hybrid data structure / filesystem representing the object store in much the same way git does internally.
+
+This should allow me to only calculate back to a previously inserted commit and simply include it in the chain.
+
+The language change gives me access to [OrbitDB](//github.com/orbitdb/) which should be exciting.
 
 # Troubleshooting
 * `fetch: manifest has unsupported version: x (we support y)` on any command
