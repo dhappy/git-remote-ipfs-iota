@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-console.debug = (msg) => process.stderr.write(`${msg}\n`)
+console.error = console.debug = console.warn = (
+  (msg) => process.stderr.write(`${msg}\n`)
+)
 
 /**
  * Remote helper programs are invoked with one or (optionally) two arguments.
@@ -14,121 +16,199 @@ if(process.argv.length < 2) {
 }
 
 const readline = require('readline')
-const rl = readline.createInterface({
-  input: process.stdin, output: process.stdout, terminal: true,
-})
-
 const Git = require('nodegit')
 const IPFS = require('ipfs')
 const IPFSProxy = require('ipfs-http-client')
-const tmp = require('tmp')
-const { exec } = require('child_process')
-const multihash = require('multihashes')
 const all = require('it-all')
+const toBuffer = require('it-to-buffer')
+const OrbitDB = require('orbit-db')
+
+const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
+const EMPTY_OBJ_CID = 'bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua'
 
 const objForSig = (sig) => ({
   name: sig.name(), email: sig.email(),
   time: sig.when().time(), offset: sig.when().offset()
 })
 
-rl.on('line', async (line) => {
+const chain = (str, val, split = '/') => {
+  const obj = {}
+  let current = obj
+  const keys = str.split(split)
+  const links = []
+
+  keys.forEach(key => {
+    current[key] = current[key] || {}
+    links.push(current = current[key])
+  })
+  links.slice(-2, -1)[0][keys.slice(-1)[0]] = val
+
+  return obj
+}
+
+(async () => {
   const repo = await Git.Repository.open('.')
   const ipfs = IPFSProxy()
+  const orbitdb = await OrbitDB.createInstance(ipfs)
+  const dbOptions = { accessController: { write: [orbitdb.identity.id] }}
+  const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
+  await cache.load()
+ 
+  const treeFor = async (root) => {
+    console.debug(`cid:${root}`)
 
-  const treeFor = async ({ cid }) => {
-    tb = Git.Treebuilder.create(repo)
-    (await ipfs.dag.get(cid)).forEach(p => {
-      tb.insert(filename, id, filemode)
-    })
-  }
+    const list = await all(ipfs.ls(root))
+    const tb = await Git.Treebuilder.create(repo, null)
+    const odb = await repo.odb()
 
-  const commitFor = async ({ cid }) => {
-    const root = (await ipfs.dag.get(cid)).value
-    const { author, committer, encoding, message, tree, parents } = root
-    const treeCID = treeFor({ cid: tree })
-
-    return Git.Commit.createBuffer(
-      repo,
-      Git.Signature.create(author.name, author.email, author.time, author.offset),
-      Git.Signature.create(committer.name, committer.email, committer.time, committer.offset),
-      encoding, message,
-      tree, parents.length, parents,
-    )
-  }
-
-  const addTree = async (tree) => {
-    var out = {}
-    await Promise.all(tree.entries().map(async e => {
-      let cid
-      if(e.isBlob()) {
-        cid = await all(ipfs.add((await e.getBlob()).content()))
-      } else if(e.isTree()) {
-        cid = await addTree(await e.getTree())
+    await Promise.all(Object.entries(list).map(async ({ name, cid, mode, type }) => {
+      if(type === 'dir') {
+        tb.insert(name, await treeFor(cid), mode)
       } else {
-        console.warn('Neither Blob nor Tree TreeEntry')
+        const buffer = await toBuffer(ipfs.cat(cid))
+        const oid = await odb.write(buffer.toString(), buffer.length, Git.Object.TYPE.BLOB)
+        tb.insert(name, oid, mode)
       }
-      out[e.name()] = { oid: e.oid(), cid: cid, mode: e.filemode() }
     }))
-    return await ipfs.dag.put(out)
+
+    return tb.write()
+  }
+
+  const commitFor = async (cid) => {
+    console.debug(`Start: ${cid}`)
+    const root = (await ipfs.dag.get(cid)).value
+    const { authorSig, committerSig, encoding, message, tree:treeCID, modes, parents:parentCIDs, signature } = root
+    const tree = await Git.Tree.lookup(repo, await treeFor(treeCID, modes))
+    console.debug(`TOID:${tree.id()}`)
+    const parents = await Promise.all(parentCIDs.map(async c => await commitFor(c)))
+    const parent_count = Object.keys(parents).length
+    const author = Git.Signature.create(authorSig.name, authorSig.email, authorSig.time, authorSig.offset)
+    const committer = Git.Signature.create(committerSig.name, committerSig.email, committerSig.time, committerSig.offset)
+
+    if(signature) {
+      const buffer = await Git.Commit.createBuffer(
+        repo, author, committer, encoding, message, tree, parent_count, parents
+      )
+      return await Git.Commit.createWithSignature(repo, buffer.toString(), signature, 'gpgsig')
+    } else {
+      return await Git.Commit.create(
+        repo, null, author, committer, encoding, message, tree, parent_count, parents
+      )
+    }
+  }
+
+  const addTree = async (tree, path = '', base = EMPTY_REPO_CID) => {
+    var modes = {}
+    for(const e of (await tree.entries())) {
+      if(e.isTree()) {
+        [base, sub] = await addTree(await e.getTree(), `${path}${e.name()}/`, base, modes)
+        modes[e.name()] = sub
+      } else if(e.filemode().toString(8)[0] === '1') { // e.isBlob() is false for links
+        let cid = await cache.get(e.oid())
+        if(!cid) {
+          cid = (await all(ipfs.add({
+            content: (await e.getBlob()).content(), mode: e.filemode()
+          })))[0].cid
+          cache.put(e.oid(), cid)
+        }
+
+        base = await ipfs.object.patch.addLink(
+          base, { name: `${path}${e.name()}`, cid: cid }, { create: true }
+        )
+        modes[e.name()] = e.filemode()
+      } else {
+        console.warn(`Neither Blob nor Tree TreeEntry: ${e.oid()} (${e.filemode().toString(8)})`)
+      }
+    }
+
+    return [base, await ipfs.dag.put(modes)]
   }
 
   const addCommit = async (oid) => {
+    process.stderr.write(`oid:${oid}: `)
     const head = await Git.Commit.lookup(repo, oid)
-    const treeCID = await addTree(await head.getTree())
-    const parents = {}
-    await Promise.all((await head.parents()).map(async p => {
-      parents[p] = await addCommit(p)
-    }))
+    const [tree, modes] = await addTree(await head.getTree())
+    process.stderr.write(`tree:${tree}\n`) // \r\x1b[A
+    const parents = await Promise.all((await head.parents()).map(p => addCommit(p)))
 
     const obj = {
       authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
       encoding: head.messageEncoding(), message: head.message(),
-      parents: parents, tree: new IPFSProxy.CID(treeCID)
+      parents: parents, tree: new IPFSProxy.CID(tree), modes: modes,
     }
     try {
       obj.signature = await head.headerField('gpgsig')
     } catch(err) { /* No signature */ }
 
-    const cid = await ipfs.dag.put(obj)
-    console.debug(cid)
-
-    return cid
+    return await ipfs.dag.put(obj)
   }
 
-  if(line === 'capabilities') {
-    process.stdout.write("push\n")
-    process.stdout.write("fetch\n\n")
-  } else if(line === 'list') {
-    const branch = await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)
-    process.stdout.write(`@${branch.value} HEAD\n`)
-    const refs = await ipfs.dag.get(`${process.argv[3]}/.git/refs`)
-    const root = await commitFor({ cid: refs.value.heads.master })
-    process.stdout.write(`${root.target()} refs/heads/master`)
-
-    console.debug((new IPFSProxy.CID(refs.value.heads.master)).codec)
-  } else if(line === 'list for-push') {
-    let refs = await repo.getReferences()
-    refs.filter(r => r.isBranch() || r.isTag()).forEach(
-      // This forces an update everytime.
-      r => process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
-    )
-    process.stdout.write("\n")
-  } else if(line.startsWith('push')) {
-    [src, dst] = line.split(' ')[1].split(':')
-    try {
-      const cid = await addCommit(await Git.Reference.nameToId(repo, src))
-      let currHash = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
-      const meta = await ipfs.dag.put({
-        HEAD: src, refs: { heads: { master: new IPFSProxy.CID(cid) } }
-      })
-      currHash = await ipfs.object.patch.addLink(
-        currHash, { name: '.git', cid: meta }, { create: true }
-      )
-      console.debug(`c:${currHash}`)
-    } catch(e) {
-      console.debug(e)
+  const serializeRefs = (root, path = 'refs') => {
+    console.debug('SERREFS')
+    if(root.cid instanceof IPFSProxy.CID) {
+      console.debug(`REF: ${root.oid} ${path}`)
+      process.stdout.write(`${root.oid} ${path}\n`)
+    } else if(root instanceof Object) {
+      Object.keys(root).forEach(k => serializeRefs(root[k], `${path}/${k}`))
     }
-  } else {
-    console.debug(line)
   }
-})
+  
+  const rl = readline.createInterface({
+    input: process.stdin, output: process.stdout, terminal: false,
+  })
+  const seen = {}
+  rl.on('line', async (line) => {
+    console.debug(line)
+    if(seen[line]) return // fetch called twice on clone
+    seen[line] = true
+
+    if(line === 'capabilities') {
+      process.stdout.write("push\n")
+      process.stdout.write("fetch\n\n")
+    } else if(line === 'list for-push') {
+      let refs = await repo.getReferences()
+      refs.filter(r => r.isBranch() || r.isTag()).forEach(
+        r => process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
+      )
+      process.stdout.write("\n")
+    } else if(line.startsWith('list')) {
+      const branch = await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)
+      process.stdout.write(`@${branch.value} HEAD\n`)
+      const refs = (await ipfs.dag.get(`${process.argv[3]}/.git/refs`)).value
+      await serializeRefs(refs)
+      process.stdout.write("\n")
+    } else if(line.startsWith('push')) {
+      try {
+        [src, dst] = line.split(' ')[1].split(':')
+      } catch(err) {
+        console.error(`Can't Push: Invalid Refs: '${line}'\n`)
+        process.exit(-12)
+      }
+      try {
+        const oid = await Git.Reference.nameToId(repo, src)
+        const obj = { oid: oid.toString(), cid: await addCommit(oid) }
+        const refs = chain(dst, obj)
+        const meta = await ipfs.dag.put({ HEAD: dst, ...refs })
+
+        let commit = (await ipfs.dag.get(`${obj.cid}`)).value
+        let base = commit.tree // don't know how to get this w/o dereferencing it
+        base = await ipfs.object.patch.addLink(
+          base, { name: '.git', cid: meta }, { create: true }
+        )
+        process.stdout.write(`ok ${dst}\n\n`)
+        process.stderr.write(`igis::${base}\n`)
+      } catch(e) {
+        console.debug(e)
+      }
+    } else if(line.startsWith('fetch')) {
+      const [_, hash, ref] = line.split(' ')
+      console.debug(line)
+      const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
+      await repo.setHead(ref)
+      console.debug(`Commit: ${commit} (${hash})`)
+      process.stdout.write("\n")
+    } else {
+      console.debug(line)
+    }
+  })
+})()
