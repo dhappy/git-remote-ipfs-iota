@@ -23,6 +23,8 @@ const all = require('it-all')
 const toBuffer = require('it-to-buffer')
 const OrbitDB = require('orbit-db')
 const os = require('os')
+const lmdb = require('node-lmdb')
+const fs = require('fs')
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
 const EMPTY_OBJ_CID = 'bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua'
@@ -55,9 +57,28 @@ const chain = (str, val, split = '/') => {
     accessController: { write: [orbitdb.identity.id] },
     directory: os.homedir() + '/.orbitdb',
   }
-  const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
-  await cache.load()
- 
+  // hanging
+  //const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
+  //await cache.load()
+  const env = new lmdb.Env()
+  const cacheDir = `${__dirname}/.git/remote-igis`
+  fs.mkdirSync(cacheDir, { recursive: true })
+  env.open({ path: cacheDir })
+  const cacheDB = env.openDbi({ name: 'hash-cache', create: true })
+  const cache = {
+    get: (key) => {
+      const txn = env.beginTxn()
+      const val = txn.getString(cacheDB, key)
+      txn.commit()
+      return val 
+    },
+    put: (key, val) => {
+      const txn = env.beginTxn()
+      txn.putString(cacheDB, key, val)
+      return txn.commit()
+    },
+  }
+  
   const treeFor = async (root, modes) => {
     console.debug(`cid:${root}`)
 

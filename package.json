@@ -26,6 +26,7 @@
     "ipfs": "^0.43.1",
     "ipfs-http-client": "^44.0.1",
     "it-all": "^1.0.2",
+    "node-lmdb": "^0.8.0",
     "nodegit": "^0.26.5",
     "orbit-db": "^0.23.1",
     "tmp": "^0.2.1"
