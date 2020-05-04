@@ -4,23 +4,22 @@ console.error = console.debug = console.warn = (
   (msg) => process.stderr.write(`${msg}\n`)
 )
 
-const readline = require('readline')
-
-console.debug(process.argv)
-
 const yargs = require('yargs');
 const IPFSProxy = require('ipfs-http-client')
 const OrbitDB = require('orbit-db')
+var levelup = require('levelup')
+var leveldown = require('leveldown')
 
 ;(async () => {
   const argv = (
     yargs
     .command('hash-cache:clear', 'Remove all entries from OID cache')
+    .command('hash-cache:dump', 'Display all entries from OID cache')
     .help().alias('help', 'h')
     .argv
   )
 
-  if (argv._.includes('hash-cache:drop')) {
+  if(argv._.includes('hash-cache:clear')) {
     const ipfs = IPFSProxy()
     const orbitdb = await OrbitDB.createInstance(ipfs)
     const dbOptions = { accessController: { write: [orbitdb.identity.id] }}
@@ -28,7 +27,18 @@ const OrbitDB = require('orbit-db')
     cache.drop()
   }
 
-  if (argv._.includes('hash-cache:clear')) {
-    console.debug('ToDo: Clear the Cache')
+  if(argv._.includes('hash-cache:dump')) {
+    const cacheDir = `${__dirname}/.git/remote-igis`
+    const cache = levelup(leveldown(cacheDir))
+    await new Promise((resolve, reject) => (
+      cache.createReadStream()
+      .on('data', function (data) {
+        process.stdout.write(`${data.key} :: ${data.value}\n`)
+      })
+      .on('error', reject)
+      .on('close', resolve)
+      .on('end', resolve)
+    ))
+    cache.close()
   }
 })()
