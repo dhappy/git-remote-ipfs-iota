@@ -22,6 +22,7 @@ const IPFSProxy = require('ipfs-http-client')
 const all = require('it-all')
 const toBuffer = require('it-to-buffer')
 const OrbitDB = require('orbit-db')
+const os = require('os')
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
 const EMPTY_OBJ_CID = 'bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua'
@@ -50,24 +51,29 @@ const chain = (str, val, split = '/') => {
   const repo = await Git.Repository.open('.')
   const ipfs = IPFSProxy()
   const orbitdb = await OrbitDB.createInstance(ipfs)
-  const dbOptions = { accessController: { write: [orbitdb.identity.id] }}
+  const dbOptions = {
+    accessController: { write: [orbitdb.identity.id] },
+    directory: os.homedir() + '/.orbitdb',
+  }
   const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
   await cache.load()
  
-  const treeFor = async (root) => {
+  const treeFor = async (root, modes) => {
     console.debug(`cid:${root}`)
 
     const list = await all(ipfs.ls(root))
     const tb = await Git.Treebuilder.create(repo, null)
     const odb = await repo.odb()
 
-    await Promise.all(Object.entries(list).map(async ({ name, cid, mode, type }) => {
+    await Promise.all(list.map(async ({ name, cid, type }) => {
+      console.debug(`${cid}:${name}:${mode}`)
       if(type === 'dir') {
-        tb.insert(name, await treeFor(cid), mode)
+        const sub = (await ipfs.dag.get(modes[name])).value
+        tb.insert(name, await treeFor(cid, sub), Git.TreeEntry.FILEMODE.TREE)
       } else {
         const buffer = await toBuffer(ipfs.cat(cid))
         const oid = await odb.write(buffer.toString(), buffer.length, Git.Object.TYPE.BLOB)
-        tb.insert(name, oid, mode)
+        tb.insert(name, oid, modes[name])
       }
     }))
 
@@ -77,8 +83,8 @@ const chain = (str, val, split = '/') => {
   const commitFor = async (cid) => {
     console.debug(`Start: ${cid}`)
     const root = (await ipfs.dag.get(cid)).value
-    const { authorSig, committerSig, encoding, message, tree:treeCID, modes, parents:parentCIDs, signature } = root
-    const tree = await Git.Tree.lookup(repo, await treeFor(treeCID, modes))
+    const { authorSig, committerSig, encoding, message, tree:treeCID, parents:parentCIDs, signature } = root
+    const tree = await Git.Tree.lookup(repo, await treeFor(treeCID))
     console.debug(`TOID:${tree.id()}`)
     const parents = await Promise.all(parentCIDs.map(async c => await commitFor(c)))
     const parent_count = Object.keys(parents).length
@@ -144,9 +150,7 @@ const chain = (str, val, split = '/') => {
   }
 
   const serializeRefs = (root, path = 'refs') => {
-    console.debug('SERREFS')
     if(root.cid instanceof IPFSProxy.CID) {
-      console.debug(`REF: ${root.oid} ${path}`)
       process.stdout.write(`${root.oid} ${path}\n`)
     } else if(root instanceof Object) {
       Object.keys(root).forEach(k => serializeRefs(root[k], `${path}/${k}`))
@@ -163,6 +167,7 @@ const chain = (str, val, split = '/') => {
     seen[line] = true
 
     if(line === 'capabilities') {
+      process.stdout.write("options\n")
       process.stdout.write("push\n")
       process.stdout.write("fetch\n\n")
     } else if(line === 'list for-push') {
@@ -188,12 +193,18 @@ const chain = (str, val, split = '/') => {
         const oid = await Git.Reference.nameToId(repo, src)
         const obj = { oid: oid.toString(), cid: await addCommit(oid) }
         const refs = chain(dst, obj)
-        const meta = await ipfs.dag.put({ HEAD: dst, ...refs })
-
+        const meta = await ipfs.dag.put(refs.refs)
+        const head = (await all(ipfs.add(Buffer.from(dst))))[0].cid
         let commit = (await ipfs.dag.get(`${obj.cid}`)).value
         let base = commit.tree // don't know how to get this w/o dereferencing it
+
+        // HEAD and refs/ are UnixFS b/c .git in the root needs to be one for the
+        // CID to be index browsable via a gateway
         base = await ipfs.object.patch.addLink(
-          base, { name: '.git', cid: meta }, { create: true }
+          base, { name: '.git/refs', cid: meta }, { create: true }
+        )
+        base = await ipfs.object.patch.addLink(
+          base, { name: '.git/HEAD', cid: head }, { create: true }
         )
         process.stdout.write(`ok ${dst}\n\n`)
         process.stderr.write(`igis::${base}\n`)
@@ -205,7 +216,7 @@ const chain = (str, val, split = '/') => {
       console.debug(line)
       const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
       await repo.setHead(ref)
-      console.debug(`Commit: ${commit} (${hash})`)
+      console.debug(`Commit: ${commit.oid()} (${hash})`)
       process.stdout.write("\n")
     } else {
       console.debug(line)

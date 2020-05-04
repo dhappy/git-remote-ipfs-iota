@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+
+console.error = console.debug = console.warn = (
+  (msg) => process.stderr.write(`${msg}\n`)
+)
+
+const readline = require('readline')
+
+console.debug(process.argv)
+
+const yargs = require('yargs');
+const IPFSProxy = require('ipfs-http-client')
+const OrbitDB = require('orbit-db')
+
+;(async () => {
+  const argv = (
+    yargs
+    .command('hash-cache:clear', 'Remove all entries from OID cache')
+    .help().alias('help', 'h')
+    .argv
+  )
+
+  if (argv._.includes('hash-cache:drop')) {
+    const ipfs = IPFSProxy()
+    const orbitdb = await OrbitDB.createInstance(ipfs)
+    const dbOptions = { accessController: { write: [orbitdb.identity.id] }}
+    const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
+    cache.drop()
+  }
+
+  if (argv._.includes('hash-cache:clear')) {
+    console.debug('ToDo: Clear the Cache')
+  }
+})()
