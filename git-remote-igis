@@ -22,35 +22,48 @@ const IPFSProxy = require('ipfs-http-client')
 const all = require('it-all')
 const toBuffer = require('it-to-buffer')
 const OrbitDB = require('orbit-db')
-var levelup = require('levelup')
-var leveldown = require('leveldown')
-const DAGPB = require('ipld-dag-pb')
+const levelup = require('levelup')
+const leveldown = require('leveldown')
+const MetaMaskConnector = require('node-metamask');
+const Web3 = require('web3')
+const open = require('open')
+const MetaMask = require('@metamask/inpage-provider')
+const LocalMessageDuplexStream = require('post-message-stream')
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
-const EMPTY_OBJ_CID = 'bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua'
 
 const objForSig = (sig) => ({
   name: sig.name(), email: sig.email(),
   time: sig.when().time(), offset: sig.when().offset()
 })
 
-const chain = (str, val, split = '/') => {
-  const obj = {}
-  let current = obj
-  const keys = str.split(split)
-  const links = []
+const metamaskStream = new LocalMessageDuplexStream({
+  name: 'inpage',
+  target: 'contentscript',
+})
+const ethereum = initProvider({ connectionStream: metamaskStream })
+const web3 = new Web3(ethereum)
+web3.personal.sign(
+  web3.fromUtf8("Howdy-Ho!"),
+  web3.eth.defaultAccount,
+  (err, sig) => (err ? console.error(err) : console.log(sig))
+)
 
-  keys.forEach(key => {
-    current[key] = current[key] || {}
-    links.push(current = current[key])
-  })
-  links.slice(-2, -1)[0][keys.slice(-1)[0]] = val
+// const connector = new MetaMaskConnector({
+//   port: 3333, // this is the default port
+//   onConnect() { console.debug('MetaMask client connected') },
+// })
+// open('http://localhost:3333')
 
-  return obj
-}
+// connector.start().then(() => {
+//   // Now go to  in your MetaMask enabled web browser.
+//   console.debug(connector.getProvider())
+//   const web3 = new Web3(connector.getProvider());
+// }))
 
 (async () => {
   const repo = await Git.Repository.open(process.env.GIT_DIR)
+  const odb = await repo.odb()
   const ipfs = IPFSProxy()
   //const orbitdb = await OrbitDB.createInstance(ipfs)
   // const dbOptions = {
@@ -61,7 +74,7 @@ const chain = (str, val, split = '/') => {
   //const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
   //await cache.load()
   
-  const cacheDir = `${__dirname}/.git/remote-igis`
+  const cacheDir = `${process.env.GIT_DIR}/remote-igis`
   const cacheDB = levelup(leveldown(cacheDir))  
   const cache = {
     get: async (key) => {
@@ -83,7 +96,6 @@ const chain = (str, val, split = '/') => {
   const treeFor = async (root, modesCID) => {
     const list = await all(ipfs.ls(root))
     const tb = await Git.Treebuilder.create(repo, null)
-    const odb = await repo.odb()
     const modes = (await ipfs.dag.get(modesCID)).value
 
     await Promise.all(list.map(async ({ name, cid, type }) => {
@@ -152,9 +164,10 @@ const chain = (str, val, split = '/') => {
       } else if(e.filemode().toString(8)[0] === '1') { // e.isBlob() is false for links
         let cid = await cache.get(e.oid())
         if(!cid) {
-          cid = (await all(ipfs.add({
-            content: (await e.getBlob()).content(), mode: e.filemode()
-          })))[0].cid
+          const content = (await e.getBlob()).content()
+          console.debug('Adding')
+          const progress = (len) => process.stderr.write(`len:${len}\n`)
+          cid = (await all(ipfs.add({ content: content, progress: progress })))[0].cid
           cache.put(e.oid(), cid)
         }
 
@@ -172,21 +185,24 @@ const chain = (str, val, split = '/') => {
 
   const addCommit = async (oid) => {
     process.stderr.write(`mit:${oid}: `)
-    const head = await Git.Commit.lookup(repo, oid)
-    const [tree, modes] = await addTree(await head.getTree())
-    process.stderr.write(`tree:${tree}\n`) // \r\x1b[A
-    const parents = await Promise.all((await head.parents()).map(p => addCommit(p)))
+    let cid = await cache.get(oid)
+    if(!cid) {
+      const head = await Git.Commit.lookup(repo, oid)
+      const [tree, modes] = await addTree(await head.getTree())
+      process.stderr.write(`tree:${tree}\n`) // \r\x1b[A
+      const parents = await Promise.all((await head.parents()).map(p => addCommit(p)))
 
-    const obj = {
-      authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
-      encoding: head.messageEncoding(), message: head.message(),
-      parents: parents, tree: new IPFSProxy.CID(tree), modes: modes,
+      const obj = {
+        authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
+        encoding: head.messageEncoding(), message: head.message(),
+        parents: parents, tree: new IPFSProxy.CID(tree), modes: modes,
+      }
+      try {
+        obj.signature = await head.headerField('gpgsig')
+      } catch(err) { /* No signature */ }
+      cid = await ipfs.dag.put(obj)
     }
-    try {
-      obj.signature = await head.headerField('gpgsig')
-    } catch(err) { /* No signature */ }
-
-    return await ipfs.dag.put(obj)
+    return cid
   }
 
   const addTag = async (oid, name) => {
@@ -306,4 +322,4 @@ const chain = (str, val, split = '/') => {
       console.debug(line)
     }
   })
-})()
+})
