@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 
 console.error = console.debug = console.warn = (
-  (msg) => process.stderr.write(`${msg}\n`)
+  (...args) => {
+    //process.stderr.write.apply(process.stderr, args.map(a => a.toString()))
+    process.stderr.write(args.map(a => a.toString()).join(' '))
+    process.stderr.write("\n")
+  }
 )
 
 /**
@@ -24,44 +28,17 @@ const toBuffer = require('it-to-buffer')
 const OrbitDB = require('orbit-db')
 const levelup = require('levelup')
 const leveldown = require('leveldown')
-const MetaMaskConnector = require('node-metamask');
-const Web3 = require('web3')
-const open = require('open')
-const MetaMask = require('@metamask/inpage-provider')
-const LocalMessageDuplexStream = require('post-message-stream')
+const { Console } = require('console');
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
+const DEBUG = process.env.GIT_IGIS_DEBUG
 
 const objForSig = (sig) => ({
   name: sig.name(), email: sig.email(),
   time: sig.when().time(), offset: sig.when().offset()
 })
 
-const metamaskStream = new LocalMessageDuplexStream({
-  name: 'inpage',
-  target: 'contentscript',
-})
-const ethereum = initProvider({ connectionStream: metamaskStream })
-const web3 = new Web3(ethereum)
-web3.personal.sign(
-  web3.fromUtf8("Howdy-Ho!"),
-  web3.eth.defaultAccount,
-  (err, sig) => (err ? console.error(err) : console.log(sig))
-)
-
-// const connector = new MetaMaskConnector({
-//   port: 3333, // this is the default port
-//   onConnect() { console.debug('MetaMask client connected') },
-// })
-// open('http://localhost:3333')
-
-// connector.start().then(() => {
-//   // Now go to  in your MetaMask enabled web browser.
-//   console.debug(connector.getProvider())
-//   const web3 = new Web3(connector.getProvider());
-// }))
-
-(async () => {
+;(async () => {
   const repo = await Git.Repository.open(process.env.GIT_DIR)
   const odb = await repo.odb()
   const ipfs = IPFSProxy()
@@ -156,6 +133,8 @@ web3.personal.sign(
   }
 
   const addTree = async (tree, path = '', base = EMPTY_REPO_CID) => {
+    DEBUG && console.debug('addTree')
+
     var modes = {}
     for(const e of (await tree.entries())) {
       if(e.isTree()) {
@@ -165,7 +144,6 @@ web3.personal.sign(
         let cid = await cache.get(e.oid())
         if(!cid) {
           const content = (await e.getBlob()).content()
-          console.debug('Adding')
           const progress = (len) => process.stderr.write(`len:${len}\n`)
           cid = (await all(ipfs.add({ content: content, progress: progress })))[0].cid
           cache.put(e.oid(), cid)
@@ -183,15 +161,39 @@ web3.personal.sign(
     return [base, await ipfs.dag.put(modes)]
   }
 
+  let oidMgr = {
+    resolvers: {},
+    convert: (oid) => {
+      if(!oidMgr.resolvers[oid]) { // new
+        addCommit(oid)
+        oidMgr.resolvers[oid] = []
+      }
+      const promise = new Promise((res, rej) => {
+        oidMgr.resolvers[oid].push(res)
+      })
+      return promise
+    },
+    cidFound: (oid, cid) => {
+      if(oidMgr.resolvers[oid]) {
+        while(oidMgr.resolvers[oid].length > 0) {
+          oidMgr.resolvers[oid].pop().call(this, cid)
+        }
+      }
+    }
+  }
+
   const addCommit = async (oid) => {
     process.stderr.write(`mit:${oid}: `)
     let cid = await cache.get(oid)
-    if(!cid) {
+    if(cid) {
+      console.debug(cid)
+      cid = new IPFSProxy.CID(cid)
+      process.stderr.write(`cache:${cid}\n`)
+    } else {
       const head = await Git.Commit.lookup(repo, oid)
       const [tree, modes] = await addTree(await head.getTree())
       process.stderr.write(`tree:${tree}\n`) // \r\x1b[A
-      const parents = await Promise.all((await head.parents()).map(p => addCommit(p)))
-
+      const parents = await Promise.all((await head.parents()).map(p => oidMgr.convert(p)))
       const obj = {
         authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
         encoding: head.messageEncoding(), message: head.message(),
@@ -201,7 +203,9 @@ web3.personal.sign(
         obj.signature = await head.headerField('gpgsig')
       } catch(err) { /* No signature */ }
       cid = await ipfs.dag.put(obj)
+      cache.put(oid, cid)
     }
+    oidMgr.cidFound(oid, cid)
     return cid
   }
 
@@ -239,7 +243,11 @@ web3.personal.sign(
 
   const doPush = async () => {
     let base, head
-    for(let [src, dst] of pushRefs) {
+    while(pushRefs.length > 0) {
+      const [src, dst] = pushRefs.pop()
+
+      DEBUG && console.debug('doPush', src, dst)
+
       try {
         const oid = await Git.Reference.nameToId(repo, src)
         const isTag = dst.split('/')[1] === 'tags'
@@ -250,10 +258,10 @@ web3.personal.sign(
             : addCommit(oid)
           ),
         }
+        console.debug('t')
         const meta = await ipfs.dag.put(obj)
 
         if(!base) {
-          console.debug(`${obj.cid}${isTag ? '/commit' : ''}`)
           base = ((await ipfs.dag.get(`${obj.cid}${isTag ? '/commit' : ''}`)).value).tree
         }
 
@@ -280,13 +288,10 @@ web3.personal.sign(
   const rl = readline.createInterface({
     input: process.stdin, output: process.stdout, terminal: false,
   })
-  const seen = {}
   const pushRefs = []
   const fetchRefs = []
   rl.on('line', async (line) => {
-    console.debug(line)
-    if(seen[line]) return // fetch called twice on clone
-    seen[line] = true
+    DEBUG && console.debug('<', line)
 
     if(line === 'capabilities') {
       process.stdout.write("options\n")
@@ -313,13 +318,17 @@ web3.personal.sign(
       }
     } else if(line.startsWith('fetch')) {
       const ref = line.replace(/^fetch\s+/, '')
-      fetchRefs.push(ref.split(' '))
+      ;[...new Set(fetchRefs)].push(ref.split(' '))
     } else if(line === '') { // a blank line follows a set of push/fetch commands
-      if(pushRefs.length > 0) await doPush()
+      if(pushRefs.length > 0) { 
+        const url = process.argv[2]
+        console.debug(url)
+        await doPush()
+      }
       if(fetchRefs.length > 0) await doFetch()
       process.stdout.write("\n")
     } else {
       console.debug(line)
     }
   })
-})
+})()
