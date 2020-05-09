@@ -1,13 +1,5 @@
 #!/usr/bin/env node
 
-console.error = console.debug = console.warn = (
-  (...args) => {
-    //process.stderr.write.apply(process.stderr, args.map(a => a.toString()))
-    process.stderr.write(args.map(a => a.toString()).join(' '))
-    process.stderr.write("\n")
-  }
-)
-
 /**
  * Remote helper programs are invoked with one or (optionally) two arguments.
  * The first argument specifies a remote repository as in Git; it is either the name of a configured remote or a URL.
@@ -29,9 +21,12 @@ const OrbitDB = require('orbit-db')
 const levelup = require('levelup')
 const leveldown = require('leveldown')
 const { Console } = require('console');
+const fs = require('fs')
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
-const DEBUG = process.env.GIT_IGIS_DEBUG
+const DEBUG = process.env.IGIS_DEBUG
+
+const console = new Console(process.stderr)
 
 const objForSig = (sig) => ({
   name: sig.name(), email: sig.email(),
@@ -50,14 +45,19 @@ const objForSig = (sig) => ({
   // hanging
   //const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
   //await cache.load()
-  
-  const cacheDir = `${process.env.GIT_DIR}/remote-igis`
+  //
+  await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
+  //
+  //const cacheDir = `${process.env.GIT_DIR}/remote-igis` // doesn't work on clone
+  const cacheDir = `.git/remote-igis`
   const cacheDB = levelup(leveldown(cacheDir))  
   const cache = {
     get: async (key) => {
-      try {
-        return await cacheDB.get(key)
-      } catch(err) { /* Not found */ }
+      if(!process.env.IGIS_NO_CACHE) {
+        try {
+          return await cacheDB.get(key)
+        } catch(err) { /* Not found */ }
+      }
     },
     put: cacheDB.put.bind(cacheDB),
   }
@@ -80,8 +80,8 @@ const objForSig = (sig) => ({
         const tree = await treeFor(cid, modes[name])
         tb.insert(name, tree, Git.TreeEntry.FILEMODE.TREE)
       } else {
-        let oid = (await cache.get(cid)).toString()
-        if(!oid || !(await oidInODB(oid))) {
+        let oid = await cache.get(cid)
+        if(!oid || !(await oidInODB(oid.toString()))) {
           const buffer = await toBuffer(ipfs.cat(cid))
           oid = await odb.write(buffer.toString(), buffer.length, Git.Object.TYPE.BLOB)
           cache.put(cid, oid)
@@ -119,22 +119,7 @@ const objForSig = (sig) => ({
     return commit
   }
 
-  const doFetch = async () => {
-    for(const [hash, ref] of fetchRefs) {
-      const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
-      if(commit.toString() !== hash) {
-        console.warn(`Generated Hash Didn't Match Requested`)
-        console.warn(` ${commit} !== ${hash}`)
-      }
-      await repo.createBranch(ref.replace(/^refs\/heads\//, ''), commit)
-      console.debug(`Created Branch: ${ref.replace(/^refs\/heads\//, '')}`)
-    }
-    await repo.setHead(fetchRefs[0][1])
-  }
-
   const addTree = async (tree, path = '', base = EMPTY_REPO_CID) => {
-    DEBUG && console.debug('addTree')
-
     var modes = {}
     for(const e of (await tree.entries())) {
       if(e.isTree()) {
@@ -186,8 +171,7 @@ const objForSig = (sig) => ({
     process.stderr.write(`mit:${oid}: `)
     let cid = await cache.get(oid)
     if(cid) {
-      console.debug(cid)
-      cid = new IPFSProxy.CID(cid)
+      cid = new IPFSProxy.CID(cid.toString())
       process.stderr.write(`cache:${cid}\n`)
     } else {
       const head = await Git.Commit.lookup(repo, oid)
@@ -236,21 +220,38 @@ const objForSig = (sig) => ({
         await serializeRefs(f.cid, `${path}/${f.name}`)
       } else {
         root = (await ipfs.dag.get(f.cid)).value
+        DEBUG && console.debug(`> ${root.oid} ${path}/${f.name}`)
         process.stdout.write(`${root.oid} ${path}/${f.name}\n`)
       }
     }))
   }
 
+  const doFetch = async (url) => {
+    console.debug('url', url)
+    for(const [hash, ref] of [...new Set(fetchRefs)]) {
+      DEBUG && console.debug('Fetching', `${process.argv[3]}/.git/${ref}/cid`)
+      const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
+      if(commit.toString() !== hash) {
+        console.warn(`Generated Hash Didn't Match Requested`)
+        console.warn(` ${commit} !== ${hash}`)
+      }
+      await repo.createBranch(ref.replace(/^refs\/heads\//, ''), commit)
+      console.debug(`Created Branch: ${ref.replace(/^refs\/heads\//, '')}`)
+    }
+    await repo.setHead(fetchRefs[0][1])
+  }
+
   const doPush = async () => {
     let base, head
     while(pushRefs.length > 0) {
-      const [src, dst] = pushRefs.pop()
+      const [src, dst] = pushRefs.shift()
 
       DEBUG && console.debug('doPush', src, dst)
 
       try {
         const oid = await Git.Reference.nameToId(repo, src)
         const isTag = dst.split('/')[1] === 'tags'
+        DEBUG && console.debug('Starting w/ OID', oid, `(${src})`)
         const obj = {
           oid: oid.toString(),
           cid: await (isTag
@@ -258,7 +259,6 @@ const objForSig = (sig) => ({
             : addCommit(oid)
           ),
         }
-        console.debug('t')
         const meta = await ipfs.dag.put(obj)
 
         if(!base) {
@@ -277,11 +277,13 @@ const objForSig = (sig) => ({
             base, { name: '.git/HEAD', cid: head }, { create: true }
           )
         }
+        DEBUG && console.debug(`> ok ${dst}`)
         process.stdout.write(`ok ${dst}\n`)
       } catch(e) {
         console.error(e)
       }
     }
+    ipfs.pin.add(base)
     process.stderr.write(`igis::${base}\n`)
   }
 
@@ -294,18 +296,24 @@ const objForSig = (sig) => ({
     DEBUG && console.debug('<', line)
 
     if(line === 'capabilities') {
-      process.stdout.write("options\n")
-      process.stdout.write("push\n")
-      process.stdout.write("fetch\n\n")
+      for(let option of ['options', 'push', 'fetch']) {
+        DEBUG && console.debug(`> ${option}`)
+        process.stdout.write(`${option}\n`)
+      }
+      process.stdout.write("\n")
     } else if(line === 'list for-push') {
       let refs = await repo.getReferences()
       refs.filter(r => r.isBranch() || r.isTag()).forEach(
-        r => process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
+        r => {
+          DEBUG && console.debug(`> 0000000000000000000000000000000000000000 ${r.name()}`)
+          process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
+        }
       )
       process.stdout.write("\n")
     } else if(line.startsWith('list')) {
-      const branch = await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)
-      process.stdout.write(`@${branch.value} HEAD\n`)
+      const branch = (await toBuffer(ipfs.cat(`${process.argv[3]}/.git/HEAD`))).toString()
+      DEBUG && console.debug(`> @${branch} HEAD`)
+      process.stdout.write(`@${branch} HEAD\n`)
       await serializeRefs(`${process.argv[3]}/.git/refs`)
       process.stdout.write("\n")
     } else if(line.startsWith('push')) {
@@ -318,15 +326,17 @@ const objForSig = (sig) => ({
       }
     } else if(line.startsWith('fetch')) {
       const ref = line.replace(/^fetch\s+/, '')
-      ;[...new Set(fetchRefs)].push(ref.split(' '))
+      fetchRefs.push(ref.split(' '))
     } else if(line === '') { // a blank line follows a set of push/fetch commands
+      const url = process.argv[2]
       if(pushRefs.length > 0) { 
-        const url = process.argv[2]
-        console.debug(url)
-        await doPush()
+        await doPush(url)
+        DEBUG && console.debug('>')
+        process.stdout.write("\n")
       }
-      if(fetchRefs.length > 0) await doFetch()
-      process.stdout.write("\n")
+      if(fetchRefs.length > 0){ 
+        await doFetch(url)
+      }
     } else {
       console.debug(line)
     }
