@@ -8,9 +8,13 @@ Push and fetch commits to IPFS.
 
 ## Usage
 
-Push:
+Push `master` with tags and get an IPFS CID back:
 
-`git push ipfs:: master`
+`git push --tags igis:: master`
+
+Push `master` with tags to the repository `:
+
+`git push --all igis::repo master`
 
 Clone an example repository:
 
@@ -30,6 +34,12 @@ Push to an IPNS remote:
 * `git remote add ipns ipns::key:mysite`
 * `git push ipns`
 * `git pull`
+
+## Workflow
+
+1. Developer Arrives
+2. Browses Open Issues
+3. Select an Issue to Work On
 
 ## Generated File Structure
 

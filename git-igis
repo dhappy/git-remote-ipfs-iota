@@ -11,6 +11,7 @@ var levelup = require('levelup')
 var leveldown = require('leveldown')
 
 ;(async () => {
+  const cacheDir = `${__dirname}/.git/remote-igis`
   const argv = (
     yargs
     .command('hash-cache:clear', 'Remove all entries from OID cache')
@@ -21,14 +22,13 @@ var leveldown = require('leveldown')
 
   if(argv._.includes('hash-cache:clear')) {
     const ipfs = IPFSProxy()
-    const orbitdb = await OrbitDB.createInstance(ipfs)
+    const orbitdb = await OrbitDB.createInstance(ipfs, { directory: cacheDir })
     const dbOptions = { accessController: { write: [orbitdb.identity.id] }}
     const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
     cache.drop()
   }
 
   if(argv._.includes('hash-cache:dump')) {
-    const cacheDir = `${__dirname}/.git/remote-igis`
     const cache = levelup(leveldown(cacheDir))
     await new Promise((resolve, reject) => (
       cache.createReadStream()

@@ -33,34 +33,50 @@ const objForSig = (sig) => ({
   time: sig.when().time(), offset: sig.when().offset()
 })
 
+if(!process.env.GIT_DIR) {
+  process.stderr.write('$GIT_DIR must be defined')
+  process.exit(-9)
+}
+
 ;(async () => {
+  const cacheDir = `${process.env.GIT_DIR}/remote-igis`
   const repo = await Git.Repository.open(process.env.GIT_DIR)
   const odb = await repo.odb()
   const ipfs = IPFSProxy()
-  //const orbitdb = await OrbitDB.createInstance(ipfs)
-  // const dbOptions = {
-  //   accessController: { write: [orbitdb.identity.id] },
-  //   directory: os.homedir() + '/.orbitdb',
-  // }
-  // hanging
-  //const cache = await orbitdb.kvstore('igis:hash-cache', dbOptions)
-  //await cache.load()
-  //
-  await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
-  //
-  //const cacheDir = `${process.env.GIT_DIR}/remote-igis` // doesn't work on clone
-  const cacheDir = `.git/remote-igis`
-  const cacheDB = levelup(leveldown(cacheDir))  
+  const orbitdb = await OrbitDB.createInstance(
+    ipfs, { directory: cacheDir }
+  )
+  const dbOptions = {
+    //accessController: { write: [orbitdb.identity.id] },
+    overwrite: true,
+  }
+  const cacheDB = await orbitdb.kvstore('igis:hash-cache', dbOptions)
+
+  process.stderr.write(`Loading: ${cacheDB.address}`)
+  await cacheDB.load()
+  process.stderr.write('Done\n')
+
   const cache = {
     get: async (key) => {
-      if(!process.env.IGIS_NO_CACHE) {
-        try {
-          return await cacheDB.get(key)
-        } catch(err) { /* Not found */ }
-      }
+      const val = cacheDB.get(key)
+      return val
     },
-    put: cacheDB.put.bind(cacheDB),
+    put: async (key, val) => cacheDB.put(key, val, { pin: true }),
   }
+
+  // await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
+  //
+  // const cacheDB = levelup(leveldown(cacheDir))  
+  // const cache = {
+  //   get: async (key) => {
+  //     if(!process.env.IGIS_NO_CACHE) {
+  //       try {
+  //         return await cacheDB.get(key)
+  //       } catch(err) { /* Not found */ }
+  //     }
+  //   },
+  //   put: cacheDB.put.bind(cacheDB),
+  // }
 
   const oidInODB = async (oid) => {
     try {
@@ -71,9 +87,14 @@ const objForSig = (sig) => ({
   }
 
   const treeFor = async (root, modesCID) => {
+    DEBUG && console.debug('treeFor()', root)
     const list = await all(ipfs.ls(root))
+    console.log('1: HERE')
     const tb = await Git.Treebuilder.create(repo, null)
+    console.log('2: HERE')
     const modes = (await ipfs.dag.get(modesCID)).value
+    console.log('3: HERE')
+
 
     await Promise.all(list.map(async ({ name, cid, type }) => {
       if(type === 'dir') {
@@ -94,13 +115,16 @@ const objForSig = (sig) => ({
   }
 
   const commitFor = async (cid) => {
+    DEBUG && console.debug('commitFor()', cid)
     const root = (await ipfs.dag.get(cid)).value
     const { authorSig, committerSig, encoding, message, tree:treeCID, modes, parents:parentCIDs, signature } = root
     const tree = await Git.Tree.lookup(repo, await treeFor(treeCID, modes))
+    console.debug(parentCIDs.length, 'parents')
     const parents = await Promise.all(parentCIDs.map(
       async c => await Git.Commit.lookup(repo, await commitFor(c))
     ))
     const parent_count = parents.length
+    console.debug(parent_count, 'parents')
     const author = Git.Signature.create(authorSig.name, authorSig.email, authorSig.time, authorSig.offset)
     const committer = Git.Signature.create(committerSig.name, committerSig.email, committerSig.time, committerSig.offset)
 
@@ -120,20 +144,27 @@ const objForSig = (sig) => ({
   }
 
   const addTree = async (tree, path = '', base = EMPTY_REPO_CID) => {
+    DEBUG && console.debug('addTree()', tree.id().toString())
     var modes = {}
     for(const e of (await tree.entries())) {
       if(e.isTree()) {
-        [base, sub] = await addTree(await e.getTree(), `${path}${e.name()}/`, base, modes)
+        DEBUG && console.debug('addTree() recursing')
+
+        ;[base, sub] = await addTree(await e.getTree(), `${path}${e.name()}/`, base, modes)
         modes[e.name()] = sub
       } else if(e.filemode().toString(8)[0] === '1') { // e.isBlob() is false for links
         let cid = await cache.get(e.oid())
         if(!cid) {
           const content = (await e.getBlob()).content()
           const progress = (len) => process.stderr.write(`len:${len}\n`)
-          cid = (await all(ipfs.add({ content: content, progress: progress })))[0].cid
+
+          DEBUG && console.debug('Adding', `${path}${e.name()}`)
+
+          cid = (await all(ipfs.add({ content: content, progress: progress, pin: true })))[0].cid
           cache.put(e.oid(), cid)
         }
 
+        DEBUG && console.debug('Patching', `${path}${e.name()}`, cid.toString())
         base = await ipfs.object.patch.addLink(
           base, { name: `${path}${e.name()}`, cid: cid }, { create: true }
         )
@@ -168,6 +199,7 @@ const objForSig = (sig) => ({
   }
 
   const addCommit = async (oid) => {
+    DEBUG && console.debug('addCommit()', oid.toString())
     process.stderr.write(`mit:${oid}: `)
     let cid = await cache.get(oid)
     if(cid) {
@@ -187,7 +219,7 @@ const objForSig = (sig) => ({
         obj.signature = await head.headerField('gpgsig')
       } catch(err) { /* No signature */ }
       cid = await ipfs.dag.put(obj)
-      cache.put(oid, cid)
+      cache.put(oid.toString(), cid)
     }
     oidMgr.cidFound(oid, cid)
     return cid
@@ -229,7 +261,7 @@ const objForSig = (sig) => ({
   const doFetch = async (url) => {
     console.debug('url', url)
     for(const [hash, ref] of [...new Set(fetchRefs)]) {
-      DEBUG && console.debug('Fetching', `${process.argv[3]}/.git/${ref}/cid`)
+      DEBUG && console.debug('doFetch()', `${process.argv[3]}/.git/${ref}/cid`)
       const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
       if(commit.toString() !== hash) {
         console.warn(`Generated Hash Didn't Match Requested`)
@@ -251,7 +283,7 @@ const objForSig = (sig) => ({
       try {
         const oid = await Git.Reference.nameToId(repo, src)
         const isTag = dst.split('/')[1] === 'tags'
-        DEBUG && console.debug('Starting w/ OID', oid, `(${src})`)
+        DEBUG && console.debug('Starting w/ OID', oid.toString(), `(${src})`)
         const obj = {
           oid: oid.toString(),
           cid: await (isTag
@@ -333,6 +365,7 @@ const objForSig = (sig) => ({
         await doPush(url)
         DEBUG && console.debug('>')
         process.stdout.write("\n")
+        cacheDB.close()
       }
       if(fetchRefs.length > 0){ 
         await doFetch(url)
