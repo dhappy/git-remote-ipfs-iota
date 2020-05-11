@@ -58,10 +58,13 @@ if(!process.env.GIT_DIR) {
 
   const cache = {
     get: async (key) => {
-      const val = cacheDB.get(key)
-      return val
+      try {
+        return cacheDB.get(key)
+      } catch(err) {
+        console.error(err)
+      }
     },
-    put: async (key, val) => cacheDB.put(key, val, { pin: true }),
+    put: async (key, val) => cacheDB.put(key, val, { pin: true }).catch(console.error),
   }
 
   // await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
@@ -105,7 +108,7 @@ if(!process.env.GIT_DIR) {
         if(!oid || !(await oidInODB(oid.toString()))) {
           const buffer = await toBuffer(ipfs.cat(cid))
           oid = await odb.write(buffer.toString(), buffer.length, Git.Object.TYPE.BLOB)
-          cache.put(cid, oid)
+          await cache.put(cid, oid) // if not awaited, the cache can close before this executes
         }
         tb.insert(name, oid, modes[name])
       }
@@ -161,7 +164,7 @@ if(!process.env.GIT_DIR) {
           DEBUG && console.debug('Adding', `${path}${e.name()}`)
 
           cid = (await all(ipfs.add({ content: content, progress: progress, pin: true })))[0].cid
-          cache.put(e.oid(), cid)
+          await cache.put(e.oid(), cid)
         }
 
         DEBUG && console.debug('Patching', `${path}${e.name()}`, cid.toString())
@@ -219,7 +222,7 @@ if(!process.env.GIT_DIR) {
         obj.signature = await head.headerField('gpgsig')
       } catch(err) { /* No signature */ }
       cid = await ipfs.dag.put(obj)
-      cache.put(oid.toString(), cid)
+      await cache.put(oid.toString(), cid)
     }
     oidMgr.cidFound(oid, cid)
     return cid
@@ -365,7 +368,7 @@ if(!process.env.GIT_DIR) {
         await doPush(url)
         DEBUG && console.debug('>')
         process.stdout.write("\n")
-        cacheDB.close()
+        cacheDB.close().catch(console.error)
       }
       if(fetchRefs.length > 0){ 
         await doFetch(url)
