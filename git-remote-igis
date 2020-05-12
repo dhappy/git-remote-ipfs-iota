@@ -13,7 +13,7 @@ if(process.argv.length < 2) {
 
 const readline = require('readline')
 const Git = require('nodegit')
-const IPFS = require('ipfs')
+//const IPFS = require('ipfs')
 const IPFSProxy = require('ipfs-http-client')
 const all = require('it-all')
 const toBuffer = require('it-to-buffer')
@@ -51,8 +51,10 @@ if(!process.env.GIT_DIR) {
     overwrite: true,
   }
   const cacheDB = await orbitdb.kvstore('igis:hash-cache', dbOptions)
+  const refsDB = await orbitdb.kvstore('igis:repositories', dbOptions)
 
-  process.stderr.write(`Loading: ${cacheDB.address}`)
+  process.stderr.write(`Loading: ${cacheDB.address}: `)
+  await refsDB.load()
   await cacheDB.load()
   process.stderr.write('Done\n')
 
@@ -64,7 +66,11 @@ if(!process.env.GIT_DIR) {
         console.error(err)
       }
     },
-    put: async (key, val) => cacheDB.put(key, val, { pin: true }).catch(console.error),
+    put: async (key, val) => {
+      if(key && val) {
+        return cacheDB.put(key, val, { pin: true }).catch(console.error)
+      }
+    },
   }
 
   // await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
@@ -92,12 +98,8 @@ if(!process.env.GIT_DIR) {
   const treeFor = async (root, modesCID) => {
     DEBUG && console.debug('treeFor()', root)
     const list = await all(ipfs.ls(root))
-    console.log('1: HERE')
     const tb = await Git.Treebuilder.create(repo, null)
-    console.log('2: HERE')
     const modes = (await ipfs.dag.get(modesCID)).value
-    console.log('3: HERE')
-
 
     await Promise.all(list.map(async ({ name, cid, type }) => {
       if(type === 'dir') {
@@ -217,6 +219,7 @@ if(!process.env.GIT_DIR) {
         authorSig: objForSig(head.author()), committerSig: objForSig(head.committer()),
         encoding: head.messageEncoding(), message: head.message(),
         parents: parents, tree: new IPFSProxy.CID(tree), modes: modes,
+        oid: oid.toString(),
       }
       try {
         obj.signature = await head.headerField('gpgsig')
@@ -249,14 +252,14 @@ if(!process.env.GIT_DIR) {
   }
 
   const serializeRefs = async (root, path = 'refs') => {
-    const list = await all(ipfs.ls(root))
-    await Promise.all(list.map(async f => {
-      if(f.type === 'dir') {
-        await serializeRefs(f.cid, `${path}/${f.name}`)
+    console.debug(root)
+    await Promise.all(Object.entries(root).map(async ([name, obj]) => {
+      console.debug(name, obj)
+      if(obj instanceof IPFSProxy.CID) {
+        serializeRefs(obj, `${path}/${name}`)
       } else {
-        root = (await ipfs.dag.get(f.cid)).value
-        DEBUG && console.debug(`> ${root.oid} ${path}/${f.name}`)
-        process.stdout.write(`${root.oid} ${path}/${f.name}\n`)
+        DEBUG && console.debug(`> ${root.oid} ${path}/${name}`)
+        process.stdout.write(`${root.oid} ${path}/${name}\n`)
       }
     }))
   }
@@ -265,11 +268,7 @@ if(!process.env.GIT_DIR) {
     console.debug('url', url)
     for(const [hash, ref] of [...new Set(fetchRefs)]) {
       DEBUG && console.debug('doFetch()', `${process.argv[3]}/.git/${ref}/cid`)
-      const commit = await commitFor(`${process.argv[3]}/.git/${ref}/cid`)
-      if(commit.toString() !== hash) {
-        console.warn(`Generated Hash Didn't Match Requested`)
-        console.warn(` ${commit} !== ${hash}`)
-      }
+      const commit = await commitFor(refsDB.get(ref))
       await repo.createBranch(ref.replace(/^refs\/heads\//, ''), commit)
       console.debug(`Created Branch: ${ref.replace(/^refs\/heads\//, '')}`)
     }
@@ -277,7 +276,7 @@ if(!process.env.GIT_DIR) {
   }
 
   const doPush = async () => {
-    let base, head
+    let base, vfs = { oidcache: {} }
     while(pushRefs.length > 0) {
       const [src, dst] = pushRefs.shift()
 
@@ -287,38 +286,36 @@ if(!process.env.GIT_DIR) {
         const oid = await Git.Reference.nameToId(repo, src)
         const isTag = dst.split('/')[1] === 'tags'
         DEBUG && console.debug('Starting w/ OID', oid.toString(), `(${src})`)
-        const obj = {
-          oid: oid.toString(),
-          cid: await (isTag
-            ? addTag(oid, dst.split('/').slice(2).join('/'))
-            : addCommit(oid)
-          ),
-        }
-        const meta = await ipfs.dag.put(obj)
-
-        if(!base) {
-          base = ((await ipfs.dag.get(`${obj.cid}${isTag ? '/commit' : ''}`)).value).tree
-        }
-
-        // HEAD and refs/ are UnixFS b/c .git in the root needs to be one for the
-        // CID to be index browsable via a gateway
-        base = await ipfs.object.patch.addLink(
-          base, { name: `.git/${dst}`, cid: meta }, { create: true }
+        const cid = await (isTag
+          ? addTag(oid, dst.split('/').slice(2).join('/'))
+          : addCommit(oid)
         )
 
-        if(!head) {
-          head = (await all(ipfs.add(Buffer.from(dst))))[0].cid
-          base = await ipfs.object.patch.addLink(
-            base, { name: '.git/HEAD', cid: head }, { create: true }
-          )
+        refsDB.put(dst, oid.toString())
+
+        if(!base) {
+          base = ((await ipfs.dag.get(`${cid}${isTag ? '/commit' : ''}`)).value).tree
         }
+        if(!vfs.HEAD) {
+          vfs.HEAD = dst
+        }
+
         DEBUG && console.debug(`> ok ${dst}`)
         process.stdout.write(`ok ${dst}\n`)
       } catch(e) {
         console.error(e)
       }
     }
+    try {
+      vfs.refs = new IPFSProxy.CID((await refsDB.saveSnapshot())[0].hash)
+      vfs.cache = new IPFSProxy.CID((await cacheDB.saveSnapshot())[0].hash)
+    } catch(err) {
+      console.error(err)
+    }
     ipfs.pin.add(base)
+    base = await ipfs.object.patch.addLink(
+      base, { name: '.git', cid: await ipfs.dag.put(vfs) }, { create: true }
+    )
     process.stderr.write(`igis::${base}\n`)
   }
 
@@ -336,20 +333,25 @@ if(!process.env.GIT_DIR) {
         process.stdout.write(`${option}\n`)
       }
       process.stdout.write("\n")
-    } else if(line === 'list for-push') {
-      let refs = await repo.getReferences()
-      refs.filter(r => r.isBranch() || r.isTag()).forEach(
-        r => {
-          DEBUG && console.debug(`> 0000000000000000000000000000000000000000 ${r.name()}`)
-          process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
-        }
-      )
-      process.stdout.write("\n")
+    // } else if(line === 'list for-push') {
+    //   let refs = await repo.getReferences()
+    //   refs.filter(r => r.isBranch() || r.isTag()).forEach(
+    //     r => {
+    //       DEBUG && console.debug(`> 0000000000000000000000000000000000000000 ${r.name()}`)
+    //       process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
+    //     }
+    //   )
+    //   process.stdout.write("\n")
     } else if(line.startsWith('list')) {
-      const branch = (await toBuffer(ipfs.cat(`${process.argv[3]}/.git/HEAD`))).toString()
-      DEBUG && console.debug(`> @${branch} HEAD`)
-      process.stdout.write(`@${branch} HEAD\n`)
-      await serializeRefs(`${process.argv[3]}/.git/refs`)
+      if(line !== 'list for-push') {
+        const branch = (await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)).value
+        DEBUG && console.debug(`> @${branch} HEAD`)
+        process.stdout.write(`@${branch} HEAD\n`)
+      }
+      for(const [ref, oid] of Object.entries(refsDB.index)) {
+        DEBUG && console.debug(`> ${oid} ${ref}`)
+        process.stdout.write(`${oid} ${ref}\n`)
+      }
       process.stdout.write("\n")
     } else if(line.startsWith('push')) {
       try {
