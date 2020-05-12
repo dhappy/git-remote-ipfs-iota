@@ -43,49 +43,17 @@ if(!process.env.GIT_DIR) {
   const repo = await Git.Repository.open(process.env.GIT_DIR)
   const odb = await repo.odb()
   const ipfs = IPFSProxy()
-  const orbitdb = await OrbitDB.createInstance(
-    ipfs, { directory: cacheDir }
-  )
-  const dbOptions = {
-    //accessController: { write: [orbitdb.identity.id] },
-    overwrite: true,
-  }
-  const cacheDB = await orbitdb.kvstore('igis:hash-cache', dbOptions)
-  const refsDB = await orbitdb.kvstore('igis:repositories', dbOptions)
-
-  process.stderr.write(`Loading: ${cacheDB.address}: `)
-  await refsDB.load()
-  await cacheDB.load()
-  process.stderr.write('Done\n')
-
+  const cacheDB = levelup(leveldown(cacheDir))  
   const cache = {
     get: async (key) => {
-      try {
-        return cacheDB.get(key)
-      } catch(err) {
-        console.error(err)
+      if(!process.env.IGIS_NO_CACHE) {
+        try {
+          return await cacheDB.get(key)
+        } catch(err) { /* Not found */ }
       }
     },
-    put: async (key, val) => {
-      if(key && val) {
-        return cacheDB.put(key, val, { pin: true }).catch(console.error)
-      }
-    },
+    put: cacheDB.put.bind(cacheDB),
   }
-
-  // await fs.promises.mkdir(`${process.env.GIT_DIR}/remote-igis`, { recursive: true })
-  //
-  // const cacheDB = levelup(leveldown(cacheDir))  
-  // const cache = {
-  //   get: async (key) => {
-  //     if(!process.env.IGIS_NO_CACHE) {
-  //       try {
-  //         return await cacheDB.get(key)
-  //       } catch(err) { /* Not found */ }
-  //     }
-  //   },
-  //   put: cacheDB.put.bind(cacheDB),
-  // }
 
   const oidInODB = async (oid) => {
     try {
@@ -96,25 +64,30 @@ if(!process.env.GIT_DIR) {
   }
 
   const treeFor = async (root, modesCID) => {
-    DEBUG && console.debug('treeFor()', root)
-    const list = await all(ipfs.ls(root))
+    DEBUG && console.debug('treeFor()', root.toString())
+    const list = await all(ipfs.ls(root.toString()))
     const tb = await Git.Treebuilder.create(repo, null)
     const modes = (await ipfs.dag.get(modesCID)).value
 
     await Promise.all(list.map(async ({ name, cid, type }) => {
       if(type === 'dir') {
         const tree = await treeFor(cid, modes[name])
-        tb.insert(name, tree, Git.TreeEntry.FILEMODE.TREE)
+        console.debug(tb.entrycount(), name, tree.toString())
+        tb.insert(name, tree.toString(), Git.TreeEntry.FILEMODE.TREE)
       } else {
         let oid = await cache.get(cid)
         if(!oid || !(await oidInODB(oid.toString()))) {
           const buffer = await toBuffer(ipfs.cat(cid))
-          oid = await odb.write(buffer.toString(), buffer.length, Git.Object.TYPE.BLOB)
+          oid = await Git.Blob.createFromBuffer(repo, buffer, buffer.length)
+
           await cache.put(cid, oid) // if not awaited, the cache can close before this executes
         }
-        tb.insert(name, oid, modes[name])
+        tb.insert(name, oid.toString(), modes[name])
       }
     }))
+    .catch(console.error)
+
+    console.debug(tb.entrycount())
 
     return tb.write()
   }
@@ -122,14 +95,16 @@ if(!process.env.GIT_DIR) {
   const commitFor = async (cid) => {
     DEBUG && console.debug('commitFor()', cid)
     const root = (await ipfs.dag.get(cid)).value
-    const { authorSig, committerSig, encoding, message, tree:treeCID, modes, parents:parentCIDs, signature } = root
-    const tree = await Git.Tree.lookup(repo, await treeFor(treeCID, modes))
-    console.debug(parentCIDs.length, 'parents')
+    const {
+      authorSig, committerSig, encoding, message, oid,
+      tree:treeCID, modes, parents:parentCIDs, signature,
+    } = root
+    const treeOID = await treeFor(treeCID, modes)
+    const tree = await Git.Tree.lookup(repo, treeOID)
     const parents = await Promise.all(parentCIDs.map(
       async c => await Git.Commit.lookup(repo, await commitFor(c))
     ))
     const parent_count = parents.length
-    console.debug(parent_count, 'parents')
     const author = Git.Signature.create(authorSig.name, authorSig.email, authorSig.time, authorSig.offset)
     const committer = Git.Signature.create(committerSig.name, committerSig.email, committerSig.time, committerSig.offset)
 
@@ -140,11 +115,15 @@ if(!process.env.GIT_DIR) {
       )
       commit = await Git.Commit.createWithSignature(repo, buffer.toString(), signature, 'gpgsig')
     } else {
+      const buffer = await Git.Commit.createBuffer(
+        repo, author, committer, encoding, message, tree, parent_count, parents
+      )
       commit = await Git.Commit.create(
         repo, null, author, committer, encoding, message, tree, parent_count, parents
       )
     }
-    process.stderr.write(`${commit} (${cid})\n`)
+    process.stderr.write(`Commit: ${commit}/${oid} (${cid})\n`)
+    process.stderr.write(`Tree OID: ${treeOID} (${treeCID})\n`)
     return commit
   }
 
@@ -169,7 +148,8 @@ if(!process.env.GIT_DIR) {
           await cache.put(e.oid(), cid)
         }
 
-        DEBUG && console.debug('Patching', `${path}${e.name()}`, cid.toString())
+        DEBUG && console.debug('Patching', `${path}${e.name()}`, cid)
+
         base = await ipfs.object.patch.addLink(
           base, { name: `${path}${e.name()}`, cid: cid }, { create: true }
         )
@@ -252,14 +232,13 @@ if(!process.env.GIT_DIR) {
   }
 
   const serializeRefs = async (root, path = 'refs') => {
-    console.debug(root)
     await Promise.all(Object.entries(root).map(async ([name, obj]) => {
-      console.debug(name, obj)
-      if(obj instanceof IPFSProxy.CID) {
-        serializeRefs(obj, `${path}/${name}`)
+      if(obj instanceof IPFSProxy.CID || obj.codec == 'dag-cbor') {
+        const commit = (await ipfs.dag.get(obj)).value
+        DEBUG && console.debug(`> ${commit.oid} ${path}/${name}`)
+        process.stdout.write(`${commit.oid} ${path}/${name}\n`)
       } else {
-        DEBUG && console.debug(`> ${root.oid} ${path}/${name}`)
-        process.stdout.write(`${root.oid} ${path}/${name}\n`)
+        await serializeRefs(obj, `${path}/${name}`)
       }
     }))
   }
@@ -267,16 +246,28 @@ if(!process.env.GIT_DIR) {
   const doFetch = async (url) => {
     console.debug('url', url)
     for(const [hash, ref] of [...new Set(fetchRefs)]) {
-      DEBUG && console.debug('doFetch()', `${process.argv[3]}/.git/${ref}/cid`)
-      const commit = await commitFor(refsDB.get(ref))
-      await repo.createBranch(ref.replace(/^refs\/heads\//, ''), commit)
-      console.debug(`Created Branch: ${ref.replace(/^refs\/heads\//, '')}`)
+      DEBUG && console.debug('doFetch()', `${process.argv[3]}/.git/${ref}`)
+      const commit = await commitFor(`${process.argv[3]}/.git/${ref}`)
+      try {
+        await repo.createBranch(ref.replace(/^refs\/heads\//, ''), commit)
+        console.debug(`Created Branch: ${ref.replace(/^refs\/heads\//, '')}`)
+      } catch(err) { /* exists */}
     }
-    await repo.setHead(fetchRefs[0][1])
+    await repo.setHead((await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)).value)
   }
 
   const doPush = async () => {
-    let base, vfs = { oidcache: {} }
+    let base, vfs = {}
+
+    try {
+      if(process.argv[3]) {
+        vfs = (await ipfs.dag.get(`${process.argv[3]}/.git/`)).value
+        vfs.HEAD = undefined
+      }
+    } catch(err) {
+      console.error(err)
+    }
+
     while(pushRefs.length > 0) {
       const [src, dst] = pushRefs.shift()
 
@@ -291,7 +282,11 @@ if(!process.env.GIT_DIR) {
           : addCommit(oid)
         )
 
-        refsDB.put(dst, oid.toString())
+        const parts = dst.split('/')
+        const last = parts.slice(0, parts.length - 1).reduce((obj, step) => {
+          return obj[step] = obj[step] || {}
+        }, vfs)
+        last[parts.slice(-1)[0]] = cid
 
         if(!base) {
           base = ((await ipfs.dag.get(`${cid}${isTag ? '/commit' : ''}`)).value).tree
@@ -306,13 +301,7 @@ if(!process.env.GIT_DIR) {
         console.error(e)
       }
     }
-    try {
-      vfs.refs = new IPFSProxy.CID((await refsDB.saveSnapshot())[0].hash)
-      vfs.cache = new IPFSProxy.CID((await cacheDB.saveSnapshot())[0].hash)
-    } catch(err) {
-      console.error(err)
-    }
-    ipfs.pin.add(base)
+    ipfs.pin.add(base, { recursive: true })
     base = await ipfs.object.patch.addLink(
       base, { name: '.git', cid: await ipfs.dag.put(vfs) }, { create: true }
     )
@@ -333,24 +322,14 @@ if(!process.env.GIT_DIR) {
         process.stdout.write(`${option}\n`)
       }
       process.stdout.write("\n")
-    // } else if(line === 'list for-push') {
-    //   let refs = await repo.getReferences()
-    //   refs.filter(r => r.isBranch() || r.isTag()).forEach(
-    //     r => {
-    //       DEBUG && console.debug(`> 0000000000000000000000000000000000000000 ${r.name()}`)
-    //       process.stdout.write(`0000000000000000000000000000000000000000 ${r.name()}\n`)
-    //     }
-    //   )
-    //   process.stdout.write("\n")
     } else if(line.startsWith('list')) {
-      if(line !== 'list for-push') {
-        const branch = (await ipfs.dag.get(`${process.argv[3]}/.git/HEAD`)).value
-        DEBUG && console.debug(`> @${branch} HEAD`)
-        process.stdout.write(`@${branch} HEAD\n`)
-      }
-      for(const [ref, oid] of Object.entries(refsDB.index)) {
-        DEBUG && console.debug(`> ${oid} ${ref}`)
-        process.stdout.write(`${oid} ${ref}\n`)
+      if(process.argv[3]) {
+        const config = (await ipfs.dag.get(`${process.argv[3]}/.git/`)).value
+        if(config.HEAD) {
+          DEBUG && console.debug(`> @${config.HEAD} HEAD`)
+          process.stdout.write(`@${config.HEAD} HEAD\n`)
+        }
+        await serializeRefs(config.refs)
       }
       process.stdout.write("\n")
     } else if(line.startsWith('push')) {
@@ -370,10 +349,15 @@ if(!process.env.GIT_DIR) {
         await doPush(url)
         DEBUG && console.debug('>')
         process.stdout.write("\n")
-        cacheDB.close().catch(console.error)
       }
       if(fetchRefs.length > 0){ 
         await doFetch(url)
+        DEBUG && console.debug('>')
+        try {
+          process.stdout.write("\n")
+        } catch(err) {
+           // this raises EPIPE for a closed pipe, but git doesn't exit otherwise
+        }
       }
     } else {
       console.debug(line)

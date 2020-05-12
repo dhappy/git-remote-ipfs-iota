@@ -28,6 +28,17 @@ var leveldown = require('leveldown')
     cache.drop()
   }
 
+  if(argv._.includes('ls')) {
+    const ipfs = IPFSProxy()
+    const orbitdb = await OrbitDB.createInstance(ipfs, { directory: cacheDir })
+    const dbOptions = { accessController: { write: [orbitdb.identity.id] } }
+    const refs = await orbitdb.kvstore('igis:revs', dbOptions)
+    console.log(`Reading From: ${refs.address}`)
+    await Promise.all(Object.entries(refs.index).map(async ([ref, cid]) => {
+      console.log('REF', ref, cid)
+    }))
+  }
+
   if(argv._.includes('hash-cache:dump')) {
     const cache = levelup(leveldown(cacheDir))
     await new Promise((resolve, reject) => (
