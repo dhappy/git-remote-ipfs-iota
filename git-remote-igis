@@ -22,9 +22,14 @@ const levelup = require('levelup')
 const leveldown = require('leveldown')
 const { Console } = require('console');
 const fs = require('fs')
+const { v1:uuidv1 } = require('uuid');
+const crypto = require('crypto');
+const { composeAPI } = require('@iota/core')
+const { asciiToTrytes, trytesToAscii } = require('@iota/converter')
+const { channelRoot, createChannel, createMessage, parseMessage, mamAttach, mamFetch, mamFetchAll } = require('@iota/mam.js');
 
 const EMPTY_REPO_CID = 'QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn'
-const DEBUG = process.env.IGIS_DEBUG
+const DEBUG = !!process.env.IGIS_DEBUG
 
 const console = new Console(process.stderr)
 
@@ -38,11 +43,38 @@ if(!process.env.GIT_DIR) {
   process.exit(-9)
 }
 
+const genSeed = (length = 81) => {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ9'
+  let seed = ''
+  do {
+    const bytes = crypto.randomBytes(1)
+    if(bytes[0] < 243) { // 243 % 27 == 0
+      seed += alphabet[bytes[0] % alphabet.length]
+    }
+  } while(seed.length < length)
+  return seed
+}
+
 ;(async () => {
-  const cacheDir = `${process.env.GIT_DIR}/remote-igis`
+  const dataDir = `${process.env.GIT_DIR}/remote-igis`
+  const cacheDir = `${dataDir}/cache`
+  const configDir = `${dataDir}/config`
   const repo = await Git.Repository.open(process.env.GIT_DIR)
   const odb = await repo.odb()
   const ipfs = IPFSProxy()
+  fs.mkdirSync(dataDir, { recursive: true })
+  const configDB = levelup(leveldown(configDir))
+  const config = {
+    get: async (key) => {
+      try {
+        return await configDB.get(key)
+      } catch(err) { /* Not found */ }
+    },
+    put: async (key, val) => {
+      await configDB.put(key, val)
+      return val
+    },
+  }
   const cacheDB = levelup(leveldown(cacheDir))  
   const cache = {
     get: async (key) => {
@@ -71,23 +103,23 @@ if(!process.env.GIT_DIR) {
 
     await Promise.all(list.map(async ({ name, cid, type }) => {
       if(type === 'dir') {
-        const tree = await treeFor(cid, modes[name])
-        console.debug(tb.entrycount(), name, tree.toString())
-        tb.insert(name, tree.toString(), Git.TreeEntry.FILEMODE.TREE)
+        let oid = await cache.get(cid)
+        if(!oid || !(await oidInODB(oid.toString()))) {
+          oid = await treeFor(cid, modes[name])
+          await cache.put(cid, oid)
+        }
+        tb.insert(name, oid.toString(), Git.TreeEntry.FILEMODE.TREE)
       } else {
         let oid = await cache.get(cid)
         if(!oid || !(await oidInODB(oid.toString()))) {
           const buffer = await toBuffer(ipfs.cat(cid))
           oid = await Git.Blob.createFromBuffer(repo, buffer, buffer.length)
-
           await cache.put(cid, oid) // if not awaited, the cache can close before this executes
         }
         tb.insert(name, oid.toString(), modes[name])
       }
     }))
     .catch(console.error)
-
-    console.debug(tb.entrycount())
 
     return tb.write()
   }
@@ -127,39 +159,45 @@ if(!process.env.GIT_DIR) {
     return commit
   }
 
-  const addTree = async (tree, path = '', base = EMPTY_REPO_CID) => {
+  const addTree = async (tree, base = EMPTY_REPO_CID) => {
     DEBUG && console.debug('addTree()', tree.id().toString())
     var modes = {}
     for(const e of (await tree.entries())) {
+      let cid = await cache.get(e.oid())
       if(e.isTree()) {
-        DEBUG && console.debug('addTree() recursing')
-
-        ;[base, sub] = await addTree(await e.getTree(), `${path}${e.name()}/`, base, modes)
-        modes[e.name()] = sub
+        let childModes = await cache.get(`modes:${e.oid()}`)
+        if(childModes) childModes = new IPFSProxy.CID(childModes.toString())
+        DEBUG && console.debug('addTree() recursing', childModes)
+        if(!cid || !childModes) {
+          DEBUG && console.debug('Cache Miss', e.oid().toString())
+          ;[cid, childModes] = await addTree(await e.getTree())
+          await cache.put(e.oid().toString(), cid)
+          await cache.put(`modes:${e.oid().toString()}`, childModes.toString())
+          console.debug('CID', cid, childModes)
+        }
+        modes[e.name()] = childModes
       } else if(e.filemode().toString(8)[0] === '1') { // e.isBlob() is false for links
-        let cid = await cache.get(e.oid())
         if(!cid) {
           const content = (await e.getBlob()).content()
           const progress = (len) => process.stderr.write(`len:${len}\n`)
 
-          DEBUG && console.debug('Adding', `${path}${e.name()}`)
+          DEBUG && console.debug('Adding', e.name())
 
           cid = (await all(ipfs.add({ content: content, progress: progress, pin: true })))[0].cid
           await cache.put(e.oid(), cid)
         }
-
-        DEBUG && console.debug('Patching', `${path}${e.name()}`, cid)
-
-        base = await ipfs.object.patch.addLink(
-          base, { name: `${path}${e.name()}`, cid: cid }, { create: true }
-        )
         modes[e.name()] = e.filemode()
       } else {
         console.warn(`Neither Blob nor Tree TreeEntry: ${e.oid()} (${e.filemode().toString(8)})`)
+        continue
       }
-    }
+      DEBUG && console.debug('Patching', e.name(), cid.toString())
+      base = await ipfs.object.patch.addLink(
+        base, { name: e.name(), cid: cid }, { pin: true }
+      )
+  }
 
-    return [base, await ipfs.dag.put(modes)]
+    return [base, await ipfs.dag.put(modes, { pin: true })]
   }
 
   let oidMgr = {
@@ -204,7 +242,7 @@ if(!process.env.GIT_DIR) {
       try {
         obj.signature = await head.headerField('gpgsig')
       } catch(err) { /* No signature */ }
-      cid = await ipfs.dag.put(obj)
+      cid = await ipfs.dag.put(obj, { pin: true })
       await cache.put(oid.toString(), cid)
     }
     oidMgr.cidFound(oid, cid)
@@ -228,7 +266,7 @@ if(!process.env.GIT_DIR) {
         name: name, commit: commit, type: 'lightweight',
       }
     }
-    return await ipfs.dag.put(obj)
+    return await ipfs.dag.put(obj, { pin: true })
   }
 
   const serializeRefs = async (root, path = 'refs') => {
@@ -257,16 +295,53 @@ if(!process.env.GIT_DIR) {
   }
 
   const doPush = async () => {
+    const tag = '99IGIS99REPOSITORY99'
+    const depth = 3
+    const mvw = 9 /* devnet */ // 14 /* mainnet */
+    const mode = 'public'
     let base, vfs = {}
 
     try {
       if(process.argv[3]) {
         vfs = (await ipfs.dag.get(`${process.argv[3]}/.git/`)).value
-        vfs.HEAD = undefined
       }
     } catch(err) {
       console.error(err)
     }
+
+    const seed = ((await config.get('key')) || await config.put('key', genSeed())).toString()
+    let channelState = vfs.channel ? {...vfs.channel, seed} : createChannel(seed, 2, mode)
+    console.debug('CHANSTATE', channelState)
+    const IOTA = composeAPI({ provider: 'https://altnodes.devnet.iota.org:443' })
+    //const IOTA = composeAPI({ provider: 'https://nodes.thetangle.org:443' })
+
+    const maxSteps = 5
+    console.debug('LR', channelState.nextRoot, channelRoot(channelState))
+    let last = { nextRoot: channelState.nextRoot || channelRoot(channelState) }
+    let steps
+    do {
+      console.debug('Walking the MAM tree to find the root', last.nextRoot)
+      steps = await mamFetchAll(IOTA, last.nextRoot, mode, undefined, maxSteps)
+      steps.forEach((s) => console.debug(s.nextRoot, trytesToAscii(s.message)))
+      if(steps.length > 0 || !last.message) {
+        last = steps.slice(-1)[0]
+      }
+    } while(steps.length === maxSteps)
+
+    try {
+      if(last) {
+        console.debug('Loading From', last.message, trytesToAscii(last.message))
+        vfs = (await ipfs.dag.get(`${trytesToAscii(last.message)}/.git/`)).value
+        channelState = vfs.channel ? {...vfs.channel, seed} : channelState
+        channelState.start++
+        channelState.nextRoot = last.nextRoot
+      }
+    } catch(err) {
+      console.error(err)
+    }
+
+    // Unset so it will be set to the commit that was just pushed
+    vfs.HEAD = undefined
 
     while(pushRefs.length > 0) {
       const [src, dst] = pushRefs.shift()
@@ -288,12 +363,8 @@ if(!process.env.GIT_DIR) {
         }, vfs)
         last[parts.slice(-1)[0]] = cid
 
-        if(!base) {
-          base = ((await ipfs.dag.get(`${cid}${isTag ? '/commit' : ''}`)).value).tree
-        }
-        if(!vfs.HEAD) {
-          vfs.HEAD = dst
-        }
+        base = base || ((await ipfs.dag.get(`${cid}${isTag ? '/commit' : ''}`)).value).tree
+        vfs.HEAD = vfs.HEAD || dst
 
         DEBUG && console.debug(`> ok ${dst}`)
         process.stdout.write(`ok ${dst}\n`)
@@ -301,11 +372,32 @@ if(!process.env.GIT_DIR) {
         console.error(e)
       }
     }
-    ipfs.pin.add(base, { recursive: true })
-    base = await ipfs.object.patch.addLink(
-      base, { name: '.git', cid: await ipfs.dag.put(vfs) }, { create: true }
+
+    vfs.uuid = vfs.uuid || uuidv1()
+
+    const channelless = await ipfs.object.patch.addLink(
+      base,
+      { name: '.git', cid: await ipfs.dag.put(vfs) },
+      { create: true }
     )
-    process.stderr.write(`igis::${base}\n`)
+
+    // check if the repo sans channel info has been uploaded already
+    let cid = await cache.get(channelless.toString())
+    if(!cid) {
+      vfs.channel = {...channelState}
+      delete vfs.channel.seed
+      cid = await ipfs.object.patch.addLink(
+        base,
+        { name: '.git', cid: await ipfs.dag.put(vfs, { pin: true }) },
+        { create: true, pin: true }
+      )
+      await cache.put(channelless.toString(), cid.toString())
+      // alters channelState adding nextRoot
+      const mamMessage = createMessage(channelState, asciiToTrytes(base.toString()))
+      await mamAttach(IOTA, mamMessage, depth, mvw, tag);
+    }
+
+    process.stderr.write(`igis::${cid.toString()}\n`)
   }
 
   const rl = readline.createInterface({

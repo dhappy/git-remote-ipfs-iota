@@ -10,6 +10,23 @@ const OrbitDB = require('orbit-db')
 var levelup = require('levelup')
 var leveldown = require('leveldown')
 
+const genSeed = () => {
+  const length = 81
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ9'
+  var randomValues = new Uint32Array(length)
+  var result = new Array(length)
+
+  window.crypto.getRandomValues(randomValues)
+
+  let cursor = 0
+  for(var i = 0; i < randomValues.length; i++) {
+    cursor += randomValues[i]
+    result[i] = chars[cursor % chars.length]
+  }
+
+  return result.join()
+}
+
 ;(async () => {
   const cacheDir = `${__dirname}/.git/remote-igis`
   const argv = (
@@ -51,5 +68,48 @@ var leveldown = require('leveldown')
       .on('end', resolve)
     ))
     cache.close()
+  }
+
+  if(argv._.includes('publish')) {
+    const { channelRoot, createChannel, createMessage, parseMessage, mamAttach, mamFetch, mamFetchAll } = require('@iota/mam.js');
+
+    // Setup the details for the channel.
+    const seed = genSeed()
+    const mode = 'public'
+
+    // Create a new channel using the details
+    // You could also load the state from persistence.
+    const channelState = createChannel(seed, 2, mode)
+
+    // Create a MAM message using the channel state.
+    // The returned mamMessage will contain address, root, nextRoot and payload.
+    // The channel state is also updated, so you should persist it if you want
+    // to add further messages in the same channel.
+    // The payload should be attached to the tangle.
+    const mamMessage = createMessage(channelState, 'MY9MESSAGE');
+
+    console.debug(mamMessage)
+
+
+    // Decode the message using the root and sideKey.
+    // The decodedMessage will contain nextRoot and message.
+    const decodedMessage = parseMessage(mamMessage.payload, mamMessage.root, sideKey);
+
+    // If we want to attach the message to the tangle we first compose the API
+    const api = composeAPI({ provider: "https://altnodes.devnet.iota.org:443" });
+    // And then attach the message, tagging it if required.
+    // Attaching will return the actual transactions attached to the tangle if you need them.
+    await mamAttach(api, mamMessage, 3, 9, "MY9MAM");
+
+    // We can also fetch a message given its root and channel details.
+    // The fetched data will contain the nextRoot and the message.
+    const fetched = await mamFetch(api, mamMessage.root, mode, sideKey)
+
+    // If you want to fetch multiple messages from a channel
+    // you need either its initial root (or start from another root).
+    const channelState = createChannel(seed, 2, mode, sideKey);
+    const initialRoot = channelRoot(channelState);
+    const chunkSize = 4;
+    const chunk = await mamFetchAll(api, channelState.initialRoot, mode, sideKey, chunkSize);
   }
 })()

@@ -12,9 +12,9 @@ Push `master` with tags and get an IPFS CID back:
 
 `git push --tags igis:: master`
 
-Push `master` with tags to the repository `:
+Push all branches to the repository `repo`:
 
-`git push --all igis::repo master`
+`git push --all igis::repo`
 
 Clone an example repository:
 
@@ -40,22 +40,19 @@ Push to an IPNS remote:
 1. Developer Arrives
 2. Browses Open Issues
 3. Select an Issue to Work On
+4. Pull Down the Active Working Tree
+5. Make Commits on the Tree
 
 ## Generated File Structure
 
 * `/`: the contents of the branch that was pushed
-* `.git/blobs/`, `.git/trees/`, `.git/commits/`, `.git/tags/`: various Git objects stored by their SHA1 hash as filename
-* `.git/refs/heads/*`: files containing the root hash of various Git branches
-* `.git/HEAD`: the name of the branch contained in this repo
+* `.git/`: CBOR-DAG representing a git repository
+* `.git/HEAD`: string entry denoting the current default branch
+* `.git/refs/(heads|tags)/*`: Pointers to commit objects
+* `[commit]/channel`: The MAM channel state
+* `[commit]/parents`: The commits parent commits
+* `[commit]/(author|committer)`: The commits author and committer signatures
 
-The virtual filesystem makes all the trees associated with all the commits available, but takes about twice as long to generate:
-
-* `.git/vfs/messages/`: all the trees linked by commit message and sorted by date
-* `.git/vfs/authors/#{name}/`: commits sorted by author
-* `.git/vfs/rev/messages/`, `.git/vfs/rev/authors/#{name}/`: the commits as before, but prefaced with a count to reverse the order
-* `.git/vfs/commits/`: vfs commits named by commit SHA1
-* `.git/vfs/trees/`: content trees named by tree SHA1
-* `.git/vfs/HEAD`: root vfs commit
 
 ## Overview
 
