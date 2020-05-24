@@ -63,6 +63,8 @@ const genSeed = (length = 81) => {
   const odb = await repo.odb()
   const ipfs = IPFSProxy()
   fs.mkdirSync(dataDir, { recursive: true })
+  // const configFile = `${dataDir}/config.json`
+  // const config = require(configFile)
   const configDB = levelup(leveldown(configDir))
   const config = {
     get: async (key) => {
@@ -173,7 +175,7 @@ const genSeed = (length = 81) => {
           ;[cid, childModes] = await addTree(await e.getTree())
           await cache.put(e.oid().toString(), cid)
           await cache.put(`modes:${e.oid().toString()}`, childModes.toString())
-          console.debug('CID', cid, childModes)
+          DEBUG && console.debug('CID', cid, childModes)
         }
         modes[e.name()] = childModes
       } else if(e.filemode().toString(8)[0] === '1') { // e.isBlob() is false for links
@@ -282,7 +284,6 @@ const genSeed = (length = 81) => {
   }
 
   const doFetch = async (url) => {
-    console.debug('url', url)
     for(const [hash, ref] of [...new Set(fetchRefs)]) {
       DEBUG && console.debug('doFetch()', `${process.argv[3]}/.git/${ref}`)
       const commit = await commitFor(`${process.argv[3]}/.git/${ref}`)
@@ -297,13 +298,17 @@ const genSeed = (length = 81) => {
   const doPush = async () => {
     const tag = '99IGIS99REPOSITORY99'
     const depth = 3
-    const mvw = 9 /* devnet */ // 14 /* mainnet */
+    const IOTA = composeAPI({ provider: 'https://altnodes.devnet.iota.org:443' })
+    const minWork = 9 /* devnet */
+    //const IOTA = composeAPI({ provider: 'https://nodes.thetangle.org:443' })
+    //const minWork = 14 /* mainnet */
     const mode = 'public'
     let base, vfs = {}
+    let prev = process.argv[3] // the previous version of the repo
 
     try {
-      if(process.argv[3]) {
-        vfs = (await ipfs.dag.get(`${process.argv[3]}/.git/`)).value
+      if(prev) {
+        vfs = (await ipfs.dag.get(`${prev}/.git/`)).value
       }
     } catch(err) {
       console.error(err)
@@ -312,11 +317,8 @@ const genSeed = (length = 81) => {
     const seed = ((await config.get('key')) || await config.put('key', genSeed())).toString()
     let channelState = vfs.channel ? {...vfs.channel, seed} : createChannel(seed, 2, mode)
     console.debug('CHANSTATE', channelState)
-    const IOTA = composeAPI({ provider: 'https://altnodes.devnet.iota.org:443' })
-    //const IOTA = composeAPI({ provider: 'https://nodes.thetangle.org:443' })
 
     const maxSteps = 5
-    console.debug('LR', channelState.nextRoot, channelRoot(channelState))
     let last = { nextRoot: channelState.nextRoot || channelRoot(channelState) }
     let steps
     do {
@@ -328,16 +330,16 @@ const genSeed = (length = 81) => {
       }
     } while(steps.length === maxSteps)
 
-    try {
-      if(last) {
+    if(last) prev = trytesToAscii(last.message)
+
+    if(prev) {
+      try {
         console.debug('Loading From', last.message, trytesToAscii(last.message))
-        vfs = (await ipfs.dag.get(`${trytesToAscii(last.message)}/.git/`)).value
+        vfs = (await ipfs.dag.get(`${prev}/.git/`)).value
         channelState = vfs.channel ? {...vfs.channel, seed} : channelState
         channelState.start++
         channelState.nextRoot = last.nextRoot
-      }
-    } catch(err) {
-      console.error(err)
+      } catch(err) { console.error(err) }
     }
 
     // Unset so it will be set to the commit that was just pushed
@@ -375,6 +377,7 @@ const genSeed = (length = 81) => {
 
     vfs.uuid = vfs.uuid || uuidv1()
 
+    delete vfs.channel
     const channelless = await ipfs.object.patch.addLink(
       base,
       { name: '.git', cid: await ipfs.dag.put(vfs) },
@@ -393,8 +396,8 @@ const genSeed = (length = 81) => {
       )
       await cache.put(channelless.toString(), cid.toString())
       // alters channelState adding nextRoot
-      const mamMessage = createMessage(channelState, asciiToTrytes(base.toString()))
-      await mamAttach(IOTA, mamMessage, depth, mvw, tag);
+      const mamMessage = createMessage(channelState, asciiToTrytes(cid.toString()))
+      await mamAttach(IOTA, mamMessage, depth, minWork, tag);
     }
 
     process.stderr.write(`igis::${cid.toString()}\n`)
