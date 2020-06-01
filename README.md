@@ -8,15 +8,25 @@ Push and fetch commits to IPFS.
 
 ## Usage
 
-Push `master` with tags and get an IPFS CID back:
+#### (Insecure) Cloud Backup
+
+1. `git push igis:: --tags # you can't push all and tags at the same time`
+2. `git push igis:: --all`
+3. Pin the resultant hash on a pinning service.
+
+#### Push `master` with tags and get an IPFS CID back:
 
 `git push --tags igis:: master`
 
-Pull a commit:
+#### Push `master` with tags and get an IPFS CID back:
+
+`git push --tags igis:: master`
+
+#### Pull a commit:
 
 `git pull igis://Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
 
-See debugging info:
+#### See debugging info:
 
 `IGIS_DEBUG=t git push ipfs::`
 
@@ -30,27 +40,19 @@ See debugging info:
 
 Each commit then has:
 
-* `parents`: The commits parent commits
+* `parents`: The commit's parent commits
 * `(author|committer)`: The commits author and committer signatures
 * `gpgsig`: Optional signature from the initial commit
 * `tree`: The filesystem state at the time of this commit
-* `modes`: `tree` is an IPFS Protobuffer-UnixFS DAG which is browsable through the web, but can't store the file mode information, so this is that.
+* `modes`: `tree` is an IPFS Protobuffer-UnixFS DAG which is browsable through the web, but can't store the file mode information, so this is that info.
 
 ## Overview
 
-Git is at its core an object database. There are four types of objects: Commits, Trees, Tags, & Blobs.
-
-When a remote helper is asked to push, it receives the key of a Commit object. That commit has an associated Tree and zero or more Commit parents.
-
-Trees are lists of umasks, names, and keys for either nested Trees or Blobs.
-
-Tags are named links to specific commits. They are frequently used to mark versions.
-
-The helper traverses the tree and parents of the root Commit and stores or retreives them from the remote.
+This remote serializes a Git commit tree to a CBOR-DAG stored in IPFS.
 
 ### IPLD Git Remote
 
-Integrating Git and IPFS has been on ongoing work with several solutions over the years. The [predecessor to this one]() stored the raw blocks in the IPFS DAG using a multihash version of git's SHA1s.
+Integrating Git and IPFS has been on ongoing work with several solutions over the years. The [predecessor to this one](//github.com/ipfs-shipyard/git-remote-ipld) stored the raw blocks in the IPFS DAG using a multihash version of git's SHA1s.
 
 The SHA1 keys used by Git aren't exactly for the hash of the object. Each serialized form is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
 

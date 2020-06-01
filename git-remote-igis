@@ -316,7 +316,6 @@ const genSeed = (length = 81) => {
 
     const seed = ((await config.get('key')) || await config.put('key', genSeed())).toString()
     let channelState = vfs.channel ? {...vfs.channel, seed} : createChannel(seed, 2, mode)
-    console.debug('CHANSTATE', channelState)
 
     const maxSteps = 5
     let last = { nextRoot: channelState.nextRoot || channelRoot(channelState) }
@@ -376,6 +375,23 @@ const genSeed = (length = 81) => {
     }
 
     vfs.uuid = vfs.uuid || uuidv1()
+
+    if(!vfs.announceAddr) { // Address repos send to when forked to find each other
+      vfs.channel = {...channelState}
+      delete vfs.channel.seed
+
+      vfs.announceAddr = genSeed()
+      const depth = 3 // milestones back to start the random walk
+      const minWeightMagnitude = 14 // mainnet (9 on test nets)
+      const trytes = asciiToTrytes(prev)
+      const transfers = [{
+        value: 0,
+        address: vfs.announceAddr,
+        message: trytes
+      }]
+      const prepared = await IOTA.prepareTransfers(seed, transfers)
+      await IOTA.sendTrytes(prepared, depth, minWeightMagnitude)
+    }
 
     delete vfs.channel
     const channelless = await ipfs.object.patch.addLink(
