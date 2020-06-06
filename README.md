@@ -1,30 +1,35 @@
-# Interplanetary Git Service (IGiS) Remote Helper
+# Interplanetary Filesystem (IPFS) Git Remote Helper
 
-Push and fetch commits to IPFS.
+Push and fetch commits to IPFS. To use the IOTA tangle to distribute the most recent version of a repo, see 
 
 ## Installation
 
-`npm install --global git-remote-igis`
+`npm install --global git-remote-ipfs`
 
 ## Usage
 
 #### (Insecure) Cloud Backup
 
-1. `git push igis:: --tags # you can't push all and tags at the same time`
-2. `git push igis:: --all`
+1. `git push ipfs:: --tags # you can't push all and tags at the same time`
+2. `git push ipfs::<CID from Step #1> --all`
 3. Pin the resultant hash on a pinning service.
 
 #### Push `master` with tags and get an IPFS CID back:
 
-`git push --tags igis:: master`
+`git push --tags ipfs:: master`
 
 #### Pull a commit:
 
-`git pull igis://Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
+`git pull ipfs::Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
+
+#### Clone a repository:
+
+`git clone ipfs::Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92 repo`
 
 #### See debugging info:
 
 `IGIS_DEBUG=t git push ipfs::`
+
 
 ## Generated File Structure
 
