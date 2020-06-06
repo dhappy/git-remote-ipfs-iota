@@ -321,16 +321,21 @@ const genSeed = (length = 81) => {
   const findRepoHead = async () => {
     const seed = config.seed
     const mode = 'public'
-    let vfs, cid
+    let cid, vfs = {}
 
     if(process.argv[3]) {
       vfs = (await ipfs.dag.get(`${process.argv[3]}/.git/`)).value
     }
 
-    channelState = vfs && vfs.channel ? {...vfs.channel, seed} : createChannel(seed, 2, mode)
+    channelState = vfs && vfs.channel && {...vfs.channel, seed}
+    
+    if(!channelState) {
+      channelState = createChannel(seed, 2, mode)
+      channelState.nextRoot = channelRoot(channelState)
+    }
 
     const maxSteps = 5
-    let last = { nextRoot: channelState.nextRoot || channelRoot(channelState) }
+    let last = {...channelState}
     let steps
     do {
       console.debug('Walking the MAM tree to find the root', last.nextRoot)
@@ -347,11 +352,13 @@ const genSeed = (length = 81) => {
       if(cid && cid !== process.argv[3]) {
         console.debug('Loading From', cid)
         vfs = (await ipfs.dag.get(`${cid}/.git/`)).value
-        vfs.channel = vfs.channel ? {...vfs.channel, seed} : channelState
-        vfs.channel.start++
-        vfs.channel.nextRoot = last.nextRoot
+        channelState = {...vfs.channel, seed}
+        channelState.start++
+        channelState.nextRoot = last.nextRoot
       }
     } catch(err) { console.error(err) }
+
+    vfs.channel = channelState
 
     return vfs
   }
@@ -465,11 +472,11 @@ const genSeed = (length = 81) => {
       }
       process.stdout.write("\n")
     } else if(line.startsWith('list')) {
-      if(vfs.HEAD) {
+      if(vfs && vfs.HEAD) {
         DEBUG && console.debug(`> @${vfs.HEAD} HEAD`)
         process.stdout.write(`@${vfs.HEAD} HEAD\n`)
       }
-      if(vfs.refs) {
+      if(vfs && vfs.refs) {
         await serializeRefs(vfs.refs)
       }
       process.stdout.write("\n")

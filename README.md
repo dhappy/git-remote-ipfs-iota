@@ -18,10 +18,6 @@ Push and fetch commits to IPFS.
 
 `git push --tags igis:: master`
 
-#### Push `master` with tags and get an IPFS CID back:
-
-`git push --tags igis:: master`
-
 #### Pull a commit:
 
 `git pull igis://Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
@@ -54,7 +50,7 @@ This remote serializes a Git commit tree to a CBOR-DAG stored in IPFS.
 
 Integrating Git and IPFS has been on ongoing work with several solutions over the years. The [predecessor to this one](//github.com/ipfs-shipyard/git-remote-ipld) stored the raw blocks in the IPFS DAG using a multihash version of git's SHA1s.
 
-The SHA1 keys used by Git aren't exactly for the hash of the object. Each serialized form is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
+The SHA1 keys used by Git aren't exactly for the hash of the object. Each git object is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
 
 Because the IPLD remote stores the raw Git blocks, the file data is fully present, but unreadable because of the header.
 
