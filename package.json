@@ -1,35 +1,35 @@
 {
-  "name": "git-remote-igis",
-  "version": "0.3.13",
-  "description": "Git remote that interacts with the IPFS ecosystem",
-  "bin": "git-remote-igis",
+  "name": "git-remote-ipfs-mam",
+  "version": "0.3.20",
+  "description": "Git remote that publishes to IPFS and broadcasts updates to the IOTA tangle.",
+  "bin": "git-remote-ipfs+mam",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dhappy/git-remote-igis.git"
+    "url": "git+https://github.com/dhappy/git-remote-ipfs-mam.git"
   },
   "keywords": [
     "IPFS",
-    "IGiS",
-    "IPNS",
     "git"
   ],
   "author": "Will Holcomb <dys@dhappy.org>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/dhappy/git-remote-igis/issues"
+    "url": "https://github.com/dhappy/git-remote-ipfs-mam/issues"
   },
-  "homepage": "https://github.com/dhappy/git-remote-igis#readme",
+  "homepage": "https://github.com/dhappy/git-remote-ipfs-mam#readme",
   "dependencies": {
     "@iota/mam.js": "^1.0.0-beta.6",
     "@metamask/inpage-provider": "^5.0.0",
     "@textile/threads-database": "^0.1.5",
+    "crypto-ld": "^3.7.0",
     "iota.crypto.js": "^0.4.2",
     "ipfs": "^0.43.1",
     "ipfs-http-client": "^44.1.0",
     "it-all": "^1.0.2",
+    "jsonld-signatures": "^5.1.0",
     "leveldown": "^5.6.0",
     "levelup": "^4.4.0",
     "node-lmdb": "^0.8.0",

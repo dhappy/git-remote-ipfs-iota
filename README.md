@@ -1,26 +1,27 @@
 # Interplanetary Filesystem (IPFS) Git Remote Helper
 
-Push and fetch commits to IPFS. To use the IOTA tangle to distribute the most recent version of a repo, see 
+Push and fetch commits to IPFS. Updates are broadcast to the IOTA tangle where others may retrieve the most recent version.
 
 ## Installation
 
-`npm install --global git-remote-ipfs`
+`npm install --global git-remote-ipfs-mam`
 
 ## Usage
 
 #### (Insecure) Cloud Backup
 
-1. `git push ipfs:: --tags # you can't push all and tags at the same time`
-2. `git push ipfs::<CID from Step #1> --all`
-3. Pin the resultant hash on a pinning service.
+1. `git remote add ipfs ipfs+mam://myproject`
+2. `git push ipfs --tags`
+3. `git push ipfs --all`
+4. Pin the resultant hash on a pinning service.
 
 #### Push `master` with tags and get an IPFS CID back:
 
-`git push --tags ipfs:: master`
+`git push --tags ipfs+mam:: master`
 
-#### Pull a commit:
+#### Pull the most recent version:
 
-`git pull ipfs::Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
+`git pull ipfs+mam::Qma5iwyvJqxzHqCT9aqyc7dxZXXGoDeSUyPYFqkCWGJw92`
 
 #### Clone a repository:
 
@@ -30,38 +31,59 @@ Push and fetch commits to IPFS. To use the IOTA tangle to distribute the most re
 
 `IGIS_DEBUG=t git push ipfs::`
 
+## IPFS Data Structures
 
-## Generated File Structure
+This program is an extension of [git-remote-ipfs](https://github.com/dhappy/git-remote-ipfs). For information about the IPFS file structure, see that repository.
 
-* `/`: the contents of the branch that was pushed
-* `.git/`: CBOR-DAG representing a git repository
-* `.git/HEAD`: string entry denoting the current default branch
-* `.git/channel`: The MAM channel state
-* `.git/refs/(heads|tags)/*`: Pointers to commit objects
+## IOTA Data Structures
 
-Each commit then has:
+In IOTA, it is possible to write to any address. A Masked Authentication Message (MAM) channel is formed by including in each published message the next address that will be used.
 
-* `parents`: The commit's parent commits
-* `(author|committer)`: The commits author and committer signatures
-* `gpgsig`: Optional signature from the initial commit
-* `tree`: The filesystem state at the time of this commit
-* `modes`: `tree` is an IPFS Protobuffer-UnixFS DAG which is browsable through the web, but can't store the file mode information, so this is that info.
+When a repository is published, this remote publishes a signed JSON Linked Data object to the MAM channel for the format:
 
-## Overview
+```javascript
+{
+  '@context': {
+    schema: 'http://schema.org/',
+    action: 'schema:action',
+    agent: 'schema:name',
+    repository: 'schema:url',
+    publisher: 'schema:url',
+    next_root: 'schema:url',
+    published_at: 'schema:datetime',
+  },
+  action: 'RepositoryUpdate',
+  repository: 'ipfs://QmThisIsTheCIDOfTheRepo',
+  publisher: 'did:key:zABase58EncodedED25519Key',
+  next_root: `iota://NEXT9TANGLE9ADDRESS9IN9THE9MAM9TREE:TAG9FROM9REPO9UUID`,
+  agent: 'git-remote-ipfs+mam',
+  published_at: new Date(),
+  'https://w3id.org/security#proof': {…}
+}
+```
 
-This remote serializes a Git commit tree to a CBOR-DAG stored in IPFS.
+Additionally, a signed JSON-LD object is published to the tangle address `99IPFS9MAM9CHNL9LINK9VA99${multicodec_of_repo_cid}` of the format:
 
-### IPLD Git Remote
+```javascript
+{
+  '@context': {
+    schema: 'http://schema.org/',
+    action: 'schema:action',
+    agent: 'schema:name',
+    publisher: 'schema:url',
+    bundle: 'schema:url',
+    published_at: 'schema:datetime',
+  },
+  action: 'MAMLink',
+  publisher: 'did:key:zABase58EncodedED25519Key',
+  bundle: `iota:bundle://IOTA9BUNDLE9HASH9In9MAM9TREE`,
+  agent: 'git-remote-ipfs+mam',
+  published_at: new Date(),
+  'https://w3id.org/security#proof': {…}
+}
+```
 
-Integrating Git and IPFS has been on ongoing work with several solutions over the years. The [predecessor to this one](//github.com/ipfs-shipyard/git-remote-ipld) stored the raw blocks in the IPFS DAG using a multihash version of git's SHA1s.
-
-The SHA1 keys used by Git aren't exactly for the hash of the object. Each git object is prefaced with a header of the format: "`#{type} #{size}\x00`". So a Blob in Git is this header plus the file contents.
-
-Because the IPLD remote stores the raw Git blocks, the file data is fully present, but unreadable because of the header.
-
-## Troubleshooting
-
-It is safe to delete `.git/remote-igis/cache/`. If you remove `.git/remote-igis/config.json` you remove the key used to write to the MAM chain and you'll have to start a new one. People following your previous chain wouldn't be able to find updates.
+If a different remote is asked to clone from that CID, it can check that address and get the bundle hash of a message in the channel. The `publisher` field is also present in the IPFS repository, so the user is able to verify the signatures (and differentiate between genuine messages and those inserted by an attacker).
 
 # License
 MIT

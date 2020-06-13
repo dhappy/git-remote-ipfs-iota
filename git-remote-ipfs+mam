@@ -1,0 +1,360 @@
+#!/usr/bin/env node
+
+/**
+ * Remote helper programs are invoked with one or (optionally) two arguments.
+ * The first argument specifies a remote repository as in Git; it is either the name of a configured remote or a URL.
+ * The second argument specifies a URL; it is usually of the form <transport>://<address>.
+ * https://git-scm.com/docs/gitremote-helpers#_invocation
+ */
+if(process.argv.length < 2) {
+  console.error('Usage: git-remote-ipfs+mam remote-name url')
+  process.exit(-10)
+}
+
+const Git = require('nodegit')
+const IPFSProxy = require('ipfs-http-client')
+const readline = require('readline')
+const { Console } = require('console');
+const fs = require('fs')
+const levelup = require('levelup')
+const leveldown = require('leveldown')
+const crypto = require('crypto');
+const { composeAPI } = require('@iota/core')
+const { asciiToTrytes, trytesToAscii } = require('@iota/converter')
+const { channelRoot, createChannel, createMessage, parseMessage, mamAttach, mamFetchAll } = require('@iota/mam.js');
+const IPFSRemote = require('../git-remote-ipfs')
+const { Ed25519KeyPair } = require('crypto-ld')
+const jsigs = require('jsonld-signatures')
+const b58 = require('bs58')
+
+const depth = 3 // milestones back to start the random walk
+// const IOTA = composeAPI({ provider: 'https://altnodes.devnet.iota.org:443' })
+// const minWeightMagnitude = 9 /* devnet */
+const IOTA = composeAPI({ provider: 'https://nodes.thetangle.org:443' })
+//const IOTA = composeAPI({ provider: 'http://localhost:14265' })
+const minWeightMagnitude = 14 /* mainnet */
+
+const DEBUG = !!process.env.DEBUG
+
+const console = new Console(process.stderr)
+
+/**
+ * Generate a random IOTA tryte string
+ *
+ * @param length: the # of chararacters to generate (default: 81)
+ */
+const genSeed = (length = 81) => {
+  const alphabet = '9ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  let seed = ''
+  do {
+    const bytes = crypto.randomBytes(1)
+    if(bytes[0] < 243) { // 243 % 27 == 0
+      seed += alphabet[bytes[0] % alphabet.length]
+    }
+  } while(seed.length < length)
+  return seed
+}
+
+/**
+ * Get the Ed25519 key pair generated from the seed created by XORing
+ * randBytes with the SHA2-512 hash of password.
+ *
+ * @param randBytes: Uint8[32] array of random data
+ * @param password: UTF-8 string of the password to hash
+ */
+const getKeyPair = async (randBytes, password) => {
+  const pwHash = crypto.createHash('sha256').update(password).digest()
+  const seed = randBytes.map((byte, i) => byte ^ pwHash[i])
+  return await Ed25519KeyPair.generate({ seed })
+}
+
+/**
+ * Generate a did:key: Distributed Identifier for the given Ed25519
+ * key pair.
+ *
+ * @param keyPair: Ed25519KeyPair
+ */
+const genDID = (keyPair) => {
+  const pubKey = b58.decode(keyPair.publicKey)
+  const varIntED = [0xED, 0x01] // 0xED is the multicodec id for Ed25519
+  const multicodec = b58.encode(Buffer.from([...varIntED, ...pubKey]))
+  const multiformat = 'z' + multicodec
+  const did = `did:key:${multiformat}`
+  return did
+}
+
+/**
+ * For a given repository CID, one can derive a discovery address which
+ * clients without a link to the MAM chain can use to find a transaction
+ * in the chain.
+ *
+ * The format is a common prefix followed by the multicodec representation
+ * of the CID.
+ *
+ * @param cid 
+ */
+const discoveryAddr = (cid) => {
+  const TRYTE_ALPHABET = '9ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
+  const val = BigInt('0x' + cid.multihash.toString('hex'))
+  const multihash = val.toString(27).split('').map(d => TRYTE_ALPHABET[parseInt(d, 27)]).join('')
+  const header = 'GIT9IPFS9DISCOVERY'
+  return `${header}${'9'.repeat(81 - multihash.length - header.length)}${multihash}`
+}
+
+/**
+ * 
+ * @param param0 
+ */
+const announceAddr = (uuid) => {
+  const TRYTE_ALPHABET = '9ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
+  const hash = crypto.createHash('sha256').update(uuid).digest('hex')
+  const id = uuid.replace(/-/g, '')
+  const val = BigInt('0x' + id + hash)
+  const addr = val.toString(27).split('').map(d => TRYTE_ALPHABET[parseInt(d, 27)]).join('')
+  return addr
+}
+
+/**
+ * Walks forward on the MAM tree until the next root hasn't been used yet.
+ * Returns the CID from that root. The provided channelState is updated so
+ * to the head of the chain.
+ *
+ * @param cache: cache with previously traversed links
+ * @param channelState: MAM channel to traverse
+ */
+const findRepoHead = async ({ channelState, cache }) => {
+  let cid
+
+  // First check the cache for previous walks of the tree
+  // We want to stop one root from the end of the chain or
+  // `mamFetchAll` won't return anything.
+  let root = channelRoot(channelState)
+  let nextRoot, prevRoot
+  do {
+    nextRoot = await cache.get(root)
+    if(nextRoot) {
+      prevRoot = root
+      root = nextRoot
+      channelState.start++
+    }
+  } while(nextRoot)
+
+  // From there consult the tangle for additional updates
+  const maxSteps = 5
+  let last = { nextRoot: (prevRoot || root).toString() }
+  let steps
+  do {
+    console.debug('Walking the MAM tree to find the root', last.nextRoot)
+    steps = await mamFetchAll(IOTA, last.nextRoot, channelState.mode, undefined, maxSteps)
+    console.debug(steps)
+    if(steps.length > 0) {
+      await cache.put(last.nextRoot, steps[0].nextRoot)
+      await Promise.all(steps.slice(1).map(async (step, i) => (
+        await cache.put(steps[i].nextRoot, step.nextRoot)
+      )))
+    }
+    if(steps.length > 0 || !last.message) {
+      channelState.nextRoot = last.nextRoot
+      channelState.start += steps.length
+      last = steps.slice(-1)[0] // potentially unset last if there's no results 
+    }
+  } while(steps.length === maxSteps)
+
+  // ToDo: validate the signature
+  if(last) cid = JSON.parse(trytesToAscii(last.message)).repository
+
+  return cid
+}
+
+const sign = async (jsonld, keyPair) => {
+  const publicKey = {
+    '@context': jsigs.SECURITY_CONTEXT_URL,
+    type: 'Ed25519VerificationKey2018',
+    id: keyPair.id, //adding a # to the key id causes a signature verification error
+    controller: `${keyPair.id}#controller`,
+    publicKeyBase58: keyPair.publicKey,
+  }
+
+  const controller = {
+    '@context': jsigs.SECURITY_CONTEXT_URL,
+    id: publicKey.controller,
+    publicKey: [publicKey],
+    authentication: [publicKey.id],
+  }
+
+  const { Ed25519Signature2018 } = jsigs.suites
+  const { AuthenticationProofPurpose } = jsigs.purposes
+
+  return await jsigs.sign(jsonld, {
+    suite: new Ed25519Signature2018({
+      verificationMethod: publicKey.id,
+      key: keyPair,
+    }),
+    purpose: new AuthenticationProofPurpose({
+      challenge: '',
+      domain: 'git-remote-ipfs+mam'
+    })
+  })
+}
+
+const announceRepo = async ({ did, cid, channelState, keyPair }) => {
+  const announceMsg = {
+    '@context': {
+      schema: 'http://schema.org/',
+      action: 'schema:action',
+      agent: 'schema:name',
+      publisher: 'schema:url',
+      bundle: 'schema:url',
+      published_at: 'schema:datetime',
+    },
+    action: 'RepositoryFork',
+    publisher: did,
+    bundle: `iota:mam://${channelState.nextRoot}`,
+    agent: 'git-remote-ipfs+mam',
+    published_at: new Date()
+  }
+  const linkSigned = await sign(linkMessage, keyPair)
+  const uuid = (await ipfs.dag.get(`${cid}/.git/uuid`)).value
+  const transfers = [{
+    value: 0,
+    address: announceAddr(uuid),
+    tag: 'IPFS9REPO99999ANNOUNCE9LINK',
+    message: asciiToTrytes(JSON.stringify(linkSigned)),
+  }]
+  const prepared = await IOTA.prepareTransfers(channelState.seed, transfers)
+  const txs = await IOTA.sendTrytes(prepared, depth, minWeightMagnitude)
+
+  return txs[0].bundle
+}
+
+const addRepoToChannel = async ({ did, cid, channelState, keyPair }) => {
+  const updateMsg = {
+    '@context': {
+      schema: 'http://schema.org/',
+      action: 'schema:action',
+      agent: 'schema:name',
+      repository: 'schema:url',
+      publisher: 'schema:url',
+      next_root: 'schema:url',
+      published_at: 'schema:datetime',
+    },
+    action: 'RepositoryUpdate',
+    repository: `ipfs://${cid}`,
+    publisher: did,
+    agent: 'git-remote-ipfs+mam',
+    published_at: new Date()
+  }
+  const updateSigned = await sign(updateMsg, keyPair)
+  const tag = 'IPFS9REPOSITORY999MAM9CHAIN'
+  const mamMessage = createMessage(channelState, asciiToTrytes(JSON.stringify(updateSigned)))
+  const txs = await mamAttach(IOTA, mamMessage, depth, minWeightMagnitude, tag)
+
+  return txs[0].bundle
+}
+
+;(async () => {
+  const repo = await Git.Repository.open(process.env.GIT_DIR)
+  const ipfs = IPFSProxy()
+  const dataDir = `${process.env.GIT_DIR}/remote-ipfs`
+  fs.mkdirSync(dataDir, { recursive: true })
+  const cacheDir = `${dataDir}/cache`
+  const cacheDB = levelup(leveldown(cacheDir))  
+  const cache = {
+    get: async (key) => {
+      if(!process.env.IGIS_NO_CACHE) {
+        try {
+          return await cacheDB.get(key)
+        } catch(err) { /* Not found */ }
+      }
+    },
+    put: cacheDB.put.bind(cacheDB),
+  }
+  const configFile = `${dataDir}/config.json`
+  if(!fs.existsSync(configFile)) {
+    const iotaSeed = genSeed()
+    const ed25519Seed = crypto.randomBytes(32).toString('hex')
+    fs.writeFileSync(configFile, JSON.stringify({
+      seed: { iota: iotaSeed, ed25519: ed25519Seed }
+    }))
+  }
+  const config = require(`${configFile[0] !== '/' ? process.cwd() : ''}/${configFile}`)
+  const keyPair = await getKeyPair(Buffer.from(config.seed.ed25519, 'hex'), 'add password later')
+  const did = keyPair.id = genDID(keyPair)
+  const meta = { publisher: did }
+  let url = process.argv[3]
+  if(url.startsWith('ipfs+mam://')) {
+    const name = url.replace(/^ipfs\+mam:\/\//, '')
+    if(name) {
+      meta.name = name
+    }
+  }
+  console.debug(meta)
+  const mode = 'public'
+  const channelState = createChannel(config.seed.iota, 2, mode)
+  url = await findRepoHead({ channelState, cache })
+  meta.mamMember = channelState.nextRoot
+  if(url && url.startsWith('ipfs://')) {
+    url = url.replace(/^ipfs:\/\//, '')
+  }
+  
+  DEBUG && console.debug(`Base CID: ${url}`)
+
+  const remote = await (new IPFSRemote({ ipfs, cache, repo, url, meta })).create()
+
+  const rl = readline.createInterface({
+    input: process.stdin, output: process.stdout, terminal: false,
+  })
+  const pushRefs = []
+  const fetchRefs = []
+  rl.on('line', async (line) => {
+    DEBUG && console.debug('<', line)
+
+    if(line === 'capabilities') {
+      for(let option of ['options', 'push', 'fetch']) {
+        DEBUG && console.debug(`> ${option}`)
+        process.stdout.write(`${option}\n`)
+      }
+      process.stdout.write("\n")
+    } else if(line.startsWith('list')) {
+      if(remote.vfs && remote.vfs.HEAD) {
+        DEBUG && console.debug(`> @${remote.vfs.HEAD} HEAD`)
+        process.stdout.write(`@${remote.vfs.HEAD} HEAD\n`)
+      }
+      if(remote.vfs && remote.vfs.refs) {
+        await remote.serializeRefs(remote.vfs.refs)
+      }
+      process.stdout.write("\n")
+    } else if(line.startsWith('push')) {
+      try {
+        const ref = line.replace(/^push\s+/, '')
+        pushRefs.push(ref.split(':'))
+      } catch(err) {
+        console.error(`Can't Push: Invalid Refs: '${line}' (${err})\n`)
+        process.exit(-12)
+      }
+    } else if(line.startsWith('fetch')) {
+      const ref = line.replace(/^fetch\s+/, '')
+      fetchRefs.push(ref.split(' '))
+    } else if(line === '') { // a blank line follows a set of push/fetch commands
+      if(pushRefs.length > 0) { 
+        const cid = await remote.doPush(pushRefs)
+        process.stderr.write(`\x1b[34mipfs::\x1b[34;1m${cid.toString()}\x1b[39;0m\n`)
+        //const tx = await addRepoToChannel({ did, cid, channelState, keyPair })
+        //process.stderr.write(`\x1b[33mipfs+mam::\x1b[33;1m${tx}\x1b[39;0m\n`)
+        DEBUG && console.debug('>')
+        process.stdout.write("\n")
+      }
+      if(fetchRefs.length > 0){ 
+        await remote.doFetch(fetchRefs)
+        DEBUG && console.debug('>')
+        try {
+          process.stdout.write("\n")
+        } catch(err) {
+            // this raises EPIPE for a closed pipe, but git doesn't exit otherwise
+        }
+      }
+    } else {
+      console.debug(line)
+    }
+  })
+})()
