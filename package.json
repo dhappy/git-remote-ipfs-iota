@@ -26,7 +26,7 @@
     "@textile/threads-database": "^0.1.5",
     "crypto-ld": "^3.7.0",
     "iota.crypto.js": "^0.4.2",
-    "ipfs": "^0.43.1",
+    "ipfs": "^0.65.0",
     "ipfs-http-client": "^44.1.0",
     "it-all": "^1.0.2",
     "jsonld-signatures": "^5.1.0",
